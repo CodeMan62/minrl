@@ -1,12 +1,13 @@
 from abc import ABC, abstractmethod 
-from typing import Optional, Dict
-from minrl.types import StepOutPut
+from typing import Optional, Dict, Tuple
+from minrl.types import StepOutPut, Observation, Info
+
 
 
 class env(ABC):
     """Base class for all envs"""
     @abstractmethod
-    def reset(self, seed: Optional[int]) -> Dict[Tuple[]]:
+    def reset(self, seed: Optional[int]) -> Tuple[Observation, Info]:
         """"""
         ...
     @abstractmethod
@@ -14,6 +15,6 @@ class env(ABC):
         """"""
         ...
     @abstractmethod
-    def get_obs(self) -> Dict[]:
+    def get_obs(self):
         """"""
         raise NotImplementedError

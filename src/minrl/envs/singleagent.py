@@ -17,5 +17,5 @@ class SingleAgentEnv(env):
         ...
     def reset(self, ):
         pass
-    def step(action):
+    def step(self, action: int):
         pass

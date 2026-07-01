@@ -15,6 +15,6 @@ class StepOutPut:
     reward: float
     terminated: bool
     truncated: bool
-    info: str
+    info: Info 
 
 

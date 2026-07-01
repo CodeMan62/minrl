@@ -116,9 +116,7 @@ class TicTacToe(SingleAgentEnv):
         empty = self.empty_cells()
         if not empty:
             return None
-        idx = random.choice(empty)
-        self.board[idx] = self.opponent_role
-        return idx
+        return random.choice(empty)
     def result_label(self, result: _GameResult) -> str:
         if result.draw:
             return "draw"
@@ -127,7 +125,7 @@ class TicTacToe(SingleAgentEnv):
         if result.winner == self.opponent_role:
             return "loss"
         return "unkown"
-    def rtr(self, result: _GameResult)->int:
+    def rtr(self, result: _GameResult) -> float:
         if result.draw:
             return 0.0
         if result.winner == self.agent_role:
@@ -152,4 +150,6 @@ class TicTacToe(SingleAgentEnv):
         # draw
         if all(cell is not None for cell in self.board):
             return _GameResult(winner=None, draw=True)
-
+    def random_policy(self) -> int:
+        """Return a random valid action."""
+        return random.choice(self.empty_cells())
