@@ -15,7 +15,7 @@ class SingleAgentEnv(env):
     @abstractmethod
     def get_obs(self)->Observation:
         ...
-    def reset(self, ):
-        pass
-    def step(self, action: int):
-        pass
+    def reset(self, seed: Optional[int] = None):
+        return self.env_reset(seed)
+    def step(self, action: int) -> StepOutPut:
+        return self.env_step(action)
