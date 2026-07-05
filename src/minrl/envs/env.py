@@ -18,3 +18,7 @@ class env(ABC):
     def get_obs(self):
         """"""
         raise NotImplementedError
+    @abstractmethod
+    def sys_prompt(self) -> str:
+        """A prompt for the system to use when interacting with the environment."""
+        ...

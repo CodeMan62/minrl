@@ -1,7 +1,9 @@
 import random
 
-from minrl.envs.singleagent import SingleAgentEnv 
-from minrl.types import StepOutPut, Observation, Info
+from minrl.envs.singleagent import SingleAgentEnv
+from minrl.types import StepOutPut, Observation, Info, Rollout
+from minrl.agents.agent import BaseAgent
+from minrl.interaction import rollout
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -24,19 +26,28 @@ class _GameResult:
 class TicTacToe(SingleAgentEnv):
     def __init__(self, ):
         super().__init__()
-        self.board: List[Optional[str]] = [None] * 9 
+        self.board: List[Optional[str]] = [None] * 9
         self.is_done: bool = False
         self.agent_role: str = random.choice(["X", "O"])
         self.opponent_role = "O" if self.agent_role == "X" else "X"
-    def env_reset(self) -> Tuple[Observation, Info]:
+    def sys_prompt(self) -> str:
+        return f"""You are playing Tic-Tac-Toe.
+            You are the agent and the opponent is the opponent. You are playing as {self.agent_role} and the opponent is playing as {self.opponent_role}. You are the first to move."""
+    def env_reset(self, seed: Optional[int] = None) -> Tuple[Observation, Info]:
+        if seed is not None:
+            random.seed(seed)
         self.board = [None] * 9
         self.is_done = False
         self.agent_role = random.choice(["X", "O"])
-        self.opponent_role = "O" if self.agent_role== "X" else "X"
+        self.opponent_role = "O" if self.agent_role == "X" else "X"
+        # X always moves first; if the agent plays O, the opponent (X) opens.
+        if self.agent_role == "O":
+            self.board[self.opponent_random_move()] = self.opponent_role
         obs = self.get_obs()
         info: Info = {
             "agent_role": self.agent_role,
-            "opponent_role": self.opponent_role
+            "opponent_role": self.opponent_role,
+            "valid_actions": self.empty_cells(),
         }
         return obs, info
     def env_step(self, action: int) -> StepOutPut:
@@ -103,6 +114,7 @@ class TicTacToe(SingleAgentEnv):
                 info=info
             )
         obs = self.get_obs()
+        info["valid_actions"] = self.empty_cells()
         return StepOutPut(
             obs=obs,
             reward=0.0,
@@ -130,7 +142,7 @@ class TicTacToe(SingleAgentEnv):
             return 0.0
         if result.winner == self.agent_role:
             return 1.0
-        return 0.0
+        return -1.0
     def get_obs(self):
         def cell(i: int) -> str:
             return self.board[i] or str(i)
@@ -144,7 +156,7 @@ class TicTacToe(SingleAgentEnv):
     def check_game(self):
         # Winner
         for a, b, c in WIN_LINES:
-            m = self.board[a] 
+            m = self.board[a]
             if m is not None and m == self.board[b] == self.board[c]:
                 return _GameResult(winner=m, draw=False)
         # draw
@@ -153,3 +165,37 @@ class TicTacToe(SingleAgentEnv):
     def random_policy(self) -> int:
         """Return a random valid action."""
         return random.choice(self.empty_cells())
+
+
+# a mock agent that returns 1
+class MockAgent(BaseAgent):
+    def act(self, obs: Observation)->int:
+        return 1
+
+# test the rollout function
+if __name__ == "__main__":
+    env = TicTacToe()
+    agent = MockAgent()
+    result = rollout(agent, env, 10)
+
+    from pprint import pprint
+
+    print("==== ROLLOUT SUMMARY ====")
+    print(f"Total steps: {result.index}")
+    print(f"Total reward: {result.total_reward}")
+    print(f"Terminated: {result.terminated}")
+    print(f"Truncated: {result.truncated}")
+    print(f"Info: {result.info}")
+
+    print("\n==== STEPS ====")
+    for step in result.steps:
+        print(f"Step {step.index}:")
+        print(f"  Prev Obs:\n{step.prev_obs}")
+        print(f"  Action: {step.action}")
+        print(f"  Next Obs:\n{step.next_obs}")
+        print(f"  Reward: {step.reward}")
+        print(f"  Terminated: {step.terminated}")
+        print(f"  Truncated: {step.truncated}")
+        print(f"  Info: {step.info}")
+        print("-" * 30)
+
