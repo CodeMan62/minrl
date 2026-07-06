@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Union, Any, List
-import json
+from typing import Dict, Union, Any, List, Optional
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
@@ -18,6 +17,9 @@ class Step:
     terminated: bool
     truncated: bool
     info: Info
+    token_ids: Optional[List[int]] = None
+    logprobs: Optional[List[float]] = None
+    action_mask: Optional[List[int]] = None
 @dataclass
 class Rollout:
     index: int

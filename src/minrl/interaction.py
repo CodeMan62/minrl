@@ -18,7 +18,10 @@ def rollout(agent: BaseAgent, env: env, num_steps) -> Rollout:
       reward=out.reward,
       terminated=out.terminated,
       truncated=out.truncated,
-      info=out.info))
+      info=out.info,
+      token_ids=getattr(agent, "last_token_ids", None),
+      logprobs=getattr(agent, "last_logprobs", None),
+      action_mask=getattr(agent, "last_action_mask", None)))
     rollout.total_reward += out.reward
     rollout.terminated = out.terminated
     rollout.truncated = out.truncated
