@@ -1,3 +1,6 @@
+from abc import ABC, abstractmethod
+from typing import List
+
 from minrl.envs.env import env
 from minrl.types import Rollout, Step
 from minrl.agents.agent import BaseAgent
@@ -29,5 +32,32 @@ def rollout(agent: BaseAgent, env: env, num_steps) -> Rollout:
     obs = out.obs
     if out.terminated or out.truncated:
       obs, info = env.reset()
-  rollout.index = len(rollout.steps)
+    rollout.index = len(rollout.steps)
   return rollout
+
+
+class InteractionProtocol(ABC):
+    """Defines *how* agents and an env interact to produce experience.
+
+    ``run()`` returns one :class:`Rollout` per learning-agent perspective, so
+    single-agent setups return a list of length 1 while self-play returns one
+    rollout per player. The trainer only calls ``run()`` and stays agnostic to
+    the interaction style (single-turn, multi-turn, self-play, ...).
+    """
+
+    @abstractmethod
+    def run(self) -> List[Rollout]:
+        ...
+
+
+class SingleAgentProtocol(InteractionProtocol):
+    """One agent interacting with one env for ``num_steps`` (auto-resetting)."""
+
+    def __init__(self, env: env, agent: BaseAgent, num_steps: int):
+        self.env = env
+        self.agent = agent
+        self.num_steps = num_steps
+
+    def run(self) -> List[Rollout]:
+        self.agent.reset()
+        return [rollout(self.agent, self.env, self.num_steps)]
