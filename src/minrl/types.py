@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Union, Any, List, Optional
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
@@ -35,6 +35,15 @@ class StepOutPut:
     reward: float
     terminated: bool
     truncated: bool
-    info: Info 
+    info: Info
+
+#-------------------inference types-----------------------
+@dataclass
+class ChatResponse:
+    text: str
+    token_idx: List[int] = field(default_factory=list)
+    logprobs: List[float] = field(default_factory=list)
+    finish_reason: Optional[str] = None
+
 
 
