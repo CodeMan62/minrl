@@ -63,13 +63,20 @@ class TicTacToe(SingleAgentEnv):
             raise RuntimeError(
                 "step() called after episode is done.Call reset()"
             )
-        if self.board[action] is not None:
+        # None (unparseable completion) or a bad/occupied cell is an illegal
+        # move: terminate with a grounded penalty instead of crashing.
+        if (
+            action is None
+            or not isinstance(action, int)
+            or not 0 <= action <= 8
+            or self.board[action] is not None
+        ):
             self.is_done = True
             obs = self.get_obs()
             info.update(
                 {
                     "illegal_move": True,
-                    "error": f"Cell {action} is already occupied.",
+                    "error": f"Invalid move: {action!r}.",
                     "agent_move": action,
                 }
             )
@@ -146,12 +153,20 @@ class TicTacToe(SingleAgentEnv):
     def get_obs(self):
         def cell(i: int) -> str:
             return self.board[i] or str(i)
-        return (
+        board = (
             f"{cell(0)} | {cell(1)} | {cell(2)}\n"
             f"---------\n"
             f"{cell(3)} | {cell(4)} | {cell(5)}\n"
             f"---------\n"
             f"{cell(6)} | {cell(7)} | {cell(8)}"
+        )
+        # The role is re-randomized every reset, so the agent can only learn
+        # the task if each observation says which mark it is playing.
+        return (
+            f"You are playing as {self.agent_role}.\n"
+            f"Board (empty cells show their number):\n{board}\n"
+            f"Empty cells: {self.empty_cells()}\n"
+            f"Your move (reply with one number):"
         )
     def check_game(self):
         # Winner

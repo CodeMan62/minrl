@@ -14,11 +14,20 @@ class ChatTemplate:
     template/tokenizer drift. Pair with :meth:`InferenceClient.complete_tokens`.
     """
 
-    def __init__(self, model: str, *, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model: str,
+        *,
+        trust_remote_code: bool = False,
+        template_kwargs: Optional[Dict[str, object]] = None,
+    ):
         self.model = model
         self.tokenizer = AutoTokenizer.from_pretrained(
             model, trust_remote_code=trust_remote_code
         )
+        # Extra kwargs forwarded to ``apply_chat_template`` on every call,
+        # e.g. ``{"enable_thinking": False}`` for Qwen3.
+        self.template_kwargs = dict(template_kwargs or {})
 
     def encode(
         self, messages: List[Message], *, add_generation_prompt: bool = True
@@ -28,6 +37,7 @@ class ChatTemplate:
             messages,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
+            **self.template_kwargs,
         )
         # Newer transformers returns a BatchEncoding; older returns a plain list.
         input_ids = getattr(out, "input_ids", out)
@@ -41,6 +51,7 @@ class ChatTemplate:
             messages,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
+            **self.template_kwargs,
         )
 
     def decode(self, token_ids: List[int], *, skip_special_tokens: bool = True) -> str:

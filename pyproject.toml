@@ -9,3 +9,8 @@ dependencies = [
     "openai>=1.0",
     "transformers>=4.44",
 ]
+
+[project.optional-dependencies]
+examples = [
+    "wandb>=0.17",
+]

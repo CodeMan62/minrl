@@ -36,6 +36,35 @@ def rollout(agent: BaseAgent, env: env, num_steps) -> Rollout:
   return rollout
 
 
+def episode(agent: BaseAgent, env: env, max_steps: int = 100) -> Rollout:
+  r = Rollout(index=0, steps=[], total_reward=0, terminated=False, truncated=False, info={})
+  obs, _ = env.reset()
+  for step in range(max_steps):
+    action = agent.act(obs)
+    out = env.step(action)
+    r.steps.append(Step(
+      index=step,
+      prev_obs=obs,
+      action=action,
+      next_obs=out.obs,
+      reward=out.reward,
+      terminated=out.terminated,
+      truncated=out.truncated,
+      info=out.info,
+      token_ids=getattr(agent, "last_token_ids", None),
+      logprobs=getattr(agent, "last_logprobs", None),
+      action_mask=getattr(agent, "last_action_mask", None)))
+    r.total_reward += out.reward
+    r.terminated = out.terminated
+    r.truncated = out.truncated
+    r.info = out.info
+    obs = out.obs
+    if out.terminated or out.truncated:
+      break
+  r.index = len(r.steps)
+  return r
+
+
 class InteractionProtocol(ABC):
     """Defines *how* agents and an env interact to produce experience.
 
