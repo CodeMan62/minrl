@@ -46,11 +46,6 @@ class LLMAgent(BaseAgent):
         return messages
 
     def act(self, obs: str) -> Optional[int]:
-        """Sample a move for ``obs`` and record its token trace.
-
-        Returns the parsed cell (``0..8``) or ``None`` when the completion has no
-        valid move — the env / reward treats ``None`` as an illegal move.
-        """
         messages = self._build_messages(obs)
         prompt_ids = self.template.encode(messages, add_generation_prompt=True)
 
