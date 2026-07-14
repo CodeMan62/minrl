@@ -15,12 +15,12 @@ from minrl.types import Rollout
 @dataclass
 class GRPOConfig:
     iterations: int = 200
-    group_size: int = 8          # episodes per update (the "G" in GRPO)
+    group_size: int = 8
     max_episode_steps: int = 16
     lr: float = 5e-6
     clip_eps: float = 0.2
     max_grad_norm: float = 1.0
-    micro_batch_size: int = 4    # sequences per forward/backward pass
+    micro_batch_size: int = 4
     log_every: int = 1
 
 
