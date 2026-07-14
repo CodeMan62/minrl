@@ -6,6 +6,8 @@ top-level `enviornments/` package) against a random opponent.
 | File | What it does |
 |---|---|
 | `train_grpo.py` | Trains Qwen3-0.6B with GRPO so its win rate vs the random opponent goes up. |
+| `generate_sft_data.py` | Rejection-samples SFT data: plays games, keeps only the ones the model won, and writes each winning move as a demonstration to `sft_data.jsonl`. |
+| `train_sft.py` | Supervised fine-tuning on that data — the model imitates its own winning moves. Same win-rate eval as GRPO, so you can chain SFT → GRPO. |
 | `tic-tac-toe-vllm.py` | Single inference call against a vLLM server; prints the token trace (ids, logprobs, action mask) the trainer consumes. Sanity-check for the vLLM path, no training. |
 
 ## Prerequisites
@@ -58,6 +60,23 @@ Notes:
   ends on an illegal move).
 - A `loss=0 ... skipped` iteration means every episode in the group got the
   same return, so all advantages are zero — normal at small group sizes.
+
+## Warm-start with SFT (rejection sampling)
+
+Before GRPO, you can teach the model the format and basic competence by
+imitation. Rejection sampling generates the demonstrations from the model
+itself: sample games, throw away the losses, and keep every move from the
+games it *won*. SFT then maximizes the log-probability of those moves — the
+same masked next-token loss as GRPO, minus the advantage/clip machinery.
+
+```bash
+python examples/tic-tac-toe/generate_sft_data.py --num-examples 500   # -> sft_data.jsonl
+python examples/tic-tac-toe/train_sft.py --epochs 3 --lr 1e-5
+```
+
+The base model must win *sometimes* for this to yield data; if it rarely does,
+raise `--max-games`/`--temperature` or pass `--keep-draws`. The resulting
+checkpoint is a solid starting point for `train_grpo.py`.
 
 ## Tracking training with W&B
 
