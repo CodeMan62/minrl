@@ -40,8 +40,8 @@ from minrl.inference.chat_template import ChatTemplate  # noqa: E402
 from minrl.inference.hf import HFClient  # noqa: E402
 from minrl.inference.parser import MoveParser  # noqa: E402
 from minrl.interaction import episode  # noqa: E402
+from minrl.algorithms import grpo  # noqa: E402
 from minrl.loggers import WandbLogger  # noqa: E402
-from minrl.trainers import GRPOConfig, GRPOTrainer  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are playing Tic-Tac-Toe against an opponent. Cells are numbered 0-8, "
@@ -138,17 +138,16 @@ def main() -> None:
 
     logger = make_logger(args)
 
-    # The trainer logs train/* metrics (mean_return, loss, ...) each step by
+    # grpo() logs train/* metrics (mean_return, loss, ...) each step by
     # itself; this script adds the env-specific extras and eval/* on top.
-    trainer = GRPOTrainer(
+    training = grpo(
         model, train_agent, env,
-        GRPOConfig(
-            iterations=args.iterations,
-            group_size=args.group_size,
-            max_episode_steps=9,      # a TicTacToe game is at most 5 own moves
-            lr=args.lr,
-            micro_batch_size=args.micro_batch_size,
-        ),
+        iterations=args.iterations,
+        group_size=args.group_size,
+        max_episode_steps=9,          # a TicTacToe game is at most 5 own moves
+        lr=args.lr,
+        micro_batch_size=args.micro_batch_size,
+        log_every=0,                  # this script prints its own line per iter
         logger=logger,
     )
 
@@ -161,8 +160,7 @@ def main() -> None:
     log_eval(0, baseline)
 
     evals = [(0, baseline)]
-    for i in range(args.iterations):
-        group, metrics = trainer.step()
+    for i, (group, metrics) in enumerate(training):
         wins = sum(1 for r in group if r.steps[-1].info.get("result") == "win")
         illegal = sum(1 for r in group if r.steps[-1].info.get("illegal_move"))
         print(

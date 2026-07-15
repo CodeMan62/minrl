@@ -1,11 +1,4 @@
-"""Metric loggers for trainers.
 
-A :class:`Logger` receives flat ``{name: value}`` metric dicts keyed by
-training step. The base class is a silent no-op so a trainer can hold one
-unconditionally; :class:`WandbLogger` forwards everything to a Weights &
-Biases run. ``wandb`` is imported lazily, so the library itself does not
-depend on it.
-"""
 
 from typing import Dict, Optional
 
@@ -24,13 +17,6 @@ class Logger:
 
 
 class WandbLogger(Logger):
-    """Log metrics to a Weights & Biases run.
-        logger = WandbLogger(project="minrl-tictactoe", config=vars(args))
-        trainer = GRPOTrainer(model, agent, env, cfg, logger=logger)
-        trainer.train()
-        logger.finish()
-    """
-
     def __init__(self, project: Optional[str] = None, **init_kwargs):
         try:
             import wandb

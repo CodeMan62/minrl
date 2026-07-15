@@ -19,7 +19,7 @@ Run (needs a GPU box to be quick; CPU works but is slow):
 
     python examples/tic-tac-toe/generate_sft_data.py --num-examples 500
 
-Then train on it with examples/tic-tac-toe/train_sft.py (SFTTrainer).
+Then train on it with examples/tic-tac-toe/train_sft.py (minrl.algorithms.sft).
 """
 
 import argparse

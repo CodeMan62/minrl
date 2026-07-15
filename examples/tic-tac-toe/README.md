@@ -81,16 +81,15 @@ checkpoint is a solid starting point for `train_grpo.py`.
 ## Tracking training with W&B
 
 W&B logging is built into the library: `minrl.loggers.WandbLogger` wraps a
-W&B run, and any logger passed to `GRPOTrainer` gets the per-iteration
+W&B run, and any logger passed to `grpo()` gets the per-iteration
 `train/*` metrics automatically:
 
 ```python
+from minrl.algorithms import grpo
 from minrl.loggers import WandbLogger
-from minrl.trainers import GRPOConfig, GRPOTrainer
 
 logger = WandbLogger(project="minrl-tictactoe")   # kwargs go to wandb.init
-trainer = GRPOTrainer(model, agent, env, cfg, logger=logger)
-trainer.train()
+history = [metrics for _, metrics in grpo(model, agent, env, logger=logger)]
 logger.finish()
 ```
 
@@ -118,7 +117,7 @@ Viewing the logs:
 - **`eval/win_rate`** is the headline chart — win rate vs the random opponent
   at iteration 0, every `--eval-every` iterations, and at the end. It should
   trend up; `eval/illegal_rate` should trend down.
-- `train/*` charts show per-iteration signals — the trainer logs
+- `train/*` charts show per-iteration signals — `grpo()` logs
   `mean_return`, `std_return`, `loss`, `n_tokens`, and `skipped` (1 when a
   zero-variance group skipped the update); the example script adds
   `win_rate` / `illegal_rate` within each training group.

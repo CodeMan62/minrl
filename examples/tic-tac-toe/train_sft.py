@@ -14,8 +14,8 @@ from minrl.agents.llm_agent import LLMAgent  # noqa: E402
 from minrl.inference.chat_template import ChatTemplate  # noqa: E402
 from minrl.inference.hf import HFClient  # noqa: E402
 from minrl.inference.parser import MoveParser  # noqa: E402
+from minrl.algorithms import sft  # noqa: E402
 from minrl.interaction import episode  # noqa: E402
-from minrl.trainers import SFTConfig, SFTTrainer  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are playing Tic-Tac-Toe against an opponent. Cells are numbered 0-8, "
@@ -92,16 +92,15 @@ def main() -> None:
     baseline = evaluate(eval_agent, env, args.eval_games)
     print(fmt_eval("[eval] before SFT", baseline))
 
-    trainer = SFTTrainer(
+    # sft() is a generator; consuming it runs the training loop.
+    history = list(sft(
         model, dataset,
-        SFTConfig(
-            epochs=args.epochs,
-            micro_batch_size=args.micro_batch_size,
-            lr=args.lr,
-            seed=args.seed,
-        ),
-    )
-    trainer.train()
+        epochs=args.epochs,
+        micro_batch_size=args.micro_batch_size,
+        lr=args.lr,
+        seed=args.seed,
+    ))
+    print(f"SFT done: {len(history)} optimizer steps")
 
     final = evaluate(eval_agent, env, args.eval_games)
     print(fmt_eval("[eval] after SFT", final))
