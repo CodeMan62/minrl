@@ -8,15 +8,22 @@ each group of episodes, and the win rate vs the random opponent is evaluated
 Inference runs *in-process* through ``HFClient`` — the sampled model IS the
 trained model, so every rollout is exactly on-policy with no weight syncing.
 
-Run (needs a GPU box; ~1.2GB of bf16 weights + optimizer states):
+By default the model is wrapped in a LoRA adapter (peft) covering every linear
+layer: the base weights stay frozen, so gradients and AdamW state exist only
+for the adapter (~1% of params) and checkpoints are a few MB. Pass
+--full-finetune to train all weights instead.
+
+Run (needs a GPU box; ~1.2GB of bf16 weights, adapter-only optimizer states):
 
     python examples/tic-tac-toe/train_grpo.py
 
 Useful knobs:
 
     python examples/tic-tac-toe/train_grpo.py \
-        --iterations 150 --group-size 8 --lr 5e-6 \
-        --eval-every 25 --eval-games 50
+        --iterations 150 --group-size 8 --lr 1e-4 \
+        --lora-r 16 --lora-alpha 32 \
+        --eval-every 25 --eval-games 50 \
+        --save-dir runs/ttt-lora
 
 A CPU smoke run (tiny + slow, just to see it move): --iterations 2
 --group-size 2 --eval-games 4 --device cpu
@@ -55,7 +62,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
     p.add_argument("--iterations", type=int, default=150)
     p.add_argument("--group-size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=5e-6)
+    p.add_argument("--lr", type=float, default=None,
+                   help="learning rate (default: 1e-4 with LoRA, 5e-6 with "
+                        "--full-finetune)")
+    p.add_argument("--full-finetune", action="store_true",
+                   help="train all weights instead of a LoRA adapter")
+    p.add_argument("--lora-r", type=int, default=16,
+                   help="LoRA rank")
+    p.add_argument("--lora-alpha", type=int, default=32,
+                   help="LoRA scaling (effective scale is alpha/r)")
+    p.add_argument("--lora-dropout", type=float, default=0.05)
+    p.add_argument("--save-dir", default=None,
+                   help="save the trained adapter (or full model) here")
     p.add_argument("--max-new-tokens", type=int, default=8)
     p.add_argument("--micro-batch-size", type=int, default=4)
     p.add_argument("--eval-every", type=int, default=25)
@@ -85,6 +103,32 @@ def make_logger(args: argparse.Namespace):
         return None
     print(f"W&B run: {logger.url}")
     return logger
+
+
+def wrap_lora(model, args: argparse.Namespace):
+    """Freeze the base model and inject a trainable LoRA adapter."""
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as e:
+        raise ImportError(
+            "LoRA training requires peft (pip install peft); "
+            "or pass --full-finetune to train all weights."
+        ) from e
+    config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules="all-linear",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(
+        f"LoRA r={args.lora_r} alpha={args.lora_alpha}: "
+        f"{trainable:,} trainable params ({trainable / total:.2%} of {total:,})"
+    )
+    return model
 
 
 def evaluate(agent: LLMAgent, env: TicTacToe, games: int) -> dict:
@@ -117,6 +161,12 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
     model.to(args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    if not args.full_finetune:
+        model = wrap_lora(model, args)
+    if args.lr is None:
+        # LoRA adapters train well at much higher learning rates than full FT.
+        args.lr = 5e-6 if args.full_finetune else 1e-4
 
     client = HFClient(model, tokenizer)
     # enable_thinking=False: Qwen3 answers directly instead of spending the
@@ -192,6 +242,14 @@ def main() -> None:
     delta = final["win"] - baseline["win"]
     print(f"\n{fmt_eval('final', final)}")
     print(f"win rate change: {baseline['win']:.0%} -> {final['win']:.0%} ({delta:+.0%})")
+
+    if args.save_dir:
+        # PeftModel.save_pretrained writes only the adapter (a few MB);
+        # with --full-finetune this saves the whole model instead.
+        model.save_pretrained(args.save_dir)
+        tokenizer.save_pretrained(args.save_dir)
+        kind = "model" if args.full_finetune else "LoRA adapter"
+        print(f"saved {kind} to {args.save_dir}")
     if logger:
         logger.log_summary(
             {

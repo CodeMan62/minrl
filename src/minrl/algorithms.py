@@ -35,7 +35,9 @@ def grpo(
 ) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
     """Train ``model`` with GRPO, yielding ``(group, metrics)`` per iteration."""
     logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad), lr=lr
+    )
     for i in range(iterations):
         group = []
         for _ in range(group_size):
@@ -159,7 +161,9 @@ def sft(
         raise ValueError("sft got an empty dataset.")
     dataset = list(dataset)
     logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad), lr=lr
+    )
     rng = random.Random(seed)
 
     step = 0
