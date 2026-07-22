@@ -13,5 +13,4 @@ dependencies = [
 [project.optional-dependencies]
 examples = [
     "wandb>=0.17",
-    "peft>=0.14",
 ]
