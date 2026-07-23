@@ -8,11 +8,6 @@ each group of episodes, and the win rate vs the random opponent is evaluated
 Inference runs *in-process* through ``HFClient`` — the sampled model IS the
 trained model, so every rollout is exactly on-policy with no weight syncing.
 
-By default the model is wrapped in a LoRA adapter (peft) covering every linear
-layer: the base weights stay frozen, so gradients and AdamW state exist only
-for the adapter (~1% of params) and checkpoints are a few MB. Pass
---full-finetune to train all weights instead.
-
 Run (needs a GPU box; ~1.2GB of bf16 weights + optimizer states):
 
     python examples/tic-tac-toe/train_grpo.py
@@ -33,7 +28,6 @@ import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
 # Repo root on sys.path so the top-level ``enviornments`` package resolves
 # regardless of the cwd this script is launched from.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -198,13 +192,6 @@ def main() -> None:
     print(f"\n{fmt_eval('final', final)}")
     print(f"win rate change: {baseline['win']:.0%} -> {final['win']:.0%} ({delta:+.0%})")
 
-    if args.save_dir:
-        # PeftModel.save_pretrained writes only the adapter (a few MB);
-        # with --full-finetune this saves the whole model instead.
-        model.save_pretrained(args.save_dir)
-        tokenizer.save_pretrained(args.save_dir)
-        kind = "model" if args.full_finetune else "LoRA adapter"
-        print(f"saved {kind} to {args.save_dir}")
     if logger:
         logger.log_summary(
             {
