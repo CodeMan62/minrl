@@ -28,6 +28,7 @@ import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, TaskType, get_peft_model
 # Repo root on sys.path so the top-level ``enviornments`` package resolves
 # regardless of the cwd this script is launched from.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -64,6 +65,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-wandb", action="store_true",
                    help="disable Weights & Biases logging")
     p.add_argument("--wandb-project", default="minrl-tictactoe")
+    p.add_argument("--lora-rank", default=8, help="defaults from best-practice guides")
+    p.add_argument("--lora-dropout", default=0.0, help="lora default dropout")
+    p.add_argument("--lora-alpha", default=32)
     p.add_argument("--wandb-run-name", default=None,
                    help="optional run name (W&B generates one if omitted)")
     return p.parse_args()
@@ -113,8 +117,16 @@ def main() -> None:
 
     dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
     print(f"loading {args.model} on {args.device} ({dtype}) ...")
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
-    model.to(args.device)
+    base_model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
+    base_model.to(args.device)
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout
+    )
+    model = get_peft_model(base_model, lora_config)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     client = HFClient(model, tokenizer)
