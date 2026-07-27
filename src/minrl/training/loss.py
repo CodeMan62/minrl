@@ -1,6 +1,6 @@
 import torch
+import torch.nn.functional as F
 from typing import List, Optional, Tuple
-from minrl.training.algorithms import Example
 # GRPO LOSS
 def _grpo_microbatch_loss(
     model, batch, total_action_tokens: int, clip_eps: float
@@ -34,10 +34,30 @@ def _grpo_microbatch_loss(
     # accumulation over micro-batches matches one big batch.
     return -(surrogate * tgt_mask).sum() / total_action_tokens
 
-##SFT loss
+
+def _reinforce_microbatch_loss(
+    model, batch, total_action_tokens: int
+) -> torch.Tensor:
+    """On-policy REINFORCE: ``-E[A * log π(a|s)]`` over action tokens."""
+    device = next(model.parameters()).device
+    max_len = max(len(ids) for ids, _, _ in batch)
+
+    ids = _pad([b[0] for b in batch], max_len, 0, torch.long, device)
+    mask = _pad([b[1] for b in batch], max_len, 0.0, torch.float32, device)
+    attn = _pad([[1] * len(b[0]) for b in batch], max_len, 0, torch.long, device)
+    adv = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=device)
+
+    logits = model(input_ids=ids, attention_mask=attn).logits[:, :-1]
+    targets = ids[:, 1:]
+    logp = -F.cross_entropy(
+        logits.float().transpose(1, 2), targets, reduction="none"
+    )
+    tgt_mask = mask[:, 1:]
+    return -(logp * adv[:, None] * tgt_mask).sum() / total_action_tokens
+
 
 def _sft_batch_loss(
-    model, batch: List[Example]
+    model, batch: List[Dict[str, List[int]]]
 ) -> Tuple[torch.Tensor, float, int]:
     device = next(model.parameters()).device
     max_len = max(len(ex["token_ids"]) for ex in batch)

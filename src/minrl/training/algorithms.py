@@ -1,16 +1,18 @@
-
 import random
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from minrl.agents.agent import BaseAgent
 from minrl.envs.env import env
 from minrl.interaction import episode
 from minrl.loggers import Logger
 from minrl.types import Rollout
-from minrl.training.loss import _grpo_microbatch_loss, _sft_batch_loss
+from minrl.training.loss import (
+    _grpo_microbatch_loss,
+    _reinforce_microbatch_loss,
+    _sft_batch_loss,
+)
 
 Example = Dict[str, List[int]]
 
@@ -166,4 +168,147 @@ def _sft_update(
     return {"loss": loss.item(), "token_acc": acc, "n_tokens": float(n_tok)}
 
 
+# --------------------------------------------------------------------------
+# REINFORCE
+# --------------------------------------------------------------------------
 
+def reinforce(
+    model,
+    agent: BaseAgent,
+    env: env,
+    *,
+    iterations: int = 200,
+    batch_size: int = 8,
+    max_episode_steps: int = 16,
+    lr: float = 5e-6,
+    max_grad_norm: float = 1.0,
+    micro_batch_size: int = 4,
+    log_every: int = 1,
+    logger: Optional[Logger] = None,
+) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
+    """Train ``model`` with vanilla REINFORCE (weight = episode return)."""
+    yield from _reinforce_loop(
+        model, agent, env,
+        iterations=iterations,
+        batch_size=batch_size,
+        max_episode_steps=max_episode_steps,
+        lr=lr,
+        max_grad_norm=max_grad_norm,
+        micro_batch_size=micro_batch_size,
+        log_every=log_every,
+        logger=logger,
+        use_baseline=False,
+    )
+
+
+def reinforce_baseline(
+    model,
+    agent: BaseAgent,
+    env: env,
+    *,
+    iterations: int = 200,
+    batch_size: int = 8,
+    max_episode_steps: int = 16,
+    lr: float = 5e-6,
+    max_grad_norm: float = 1.0,
+    micro_batch_size: int = 4,
+    log_every: int = 1,
+    logger: Optional[Logger] = None,
+) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
+    """REINFORCE with a batch-mean return baseline: weight = ``R - mean(R)``."""
+    yield from _reinforce_loop(
+        model, agent, env,
+        iterations=iterations,
+        batch_size=batch_size,
+        max_episode_steps=max_episode_steps,
+        lr=lr,
+        max_grad_norm=max_grad_norm,
+        micro_batch_size=micro_batch_size,
+        log_every=log_every,
+        logger=logger,
+        use_baseline=True,
+    )
+
+
+def _reinforce_loop(
+    model,
+    agent: BaseAgent,
+    env: env,
+    *,
+    iterations: int,
+    batch_size: int,
+    max_episode_steps: int,
+    lr: float,
+    max_grad_norm: float,
+    micro_batch_size: int,
+    log_every: int,
+    logger: Optional[Logger],
+    use_baseline: bool,
+) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
+    logger = logger or Logger()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    for i in range(iterations):
+        batch = []
+        for _ in range(batch_size):
+            agent.reset()
+            batch.append(episode(agent, env, max_episode_steps))
+        metrics = _reinforce_update(
+            model, optimizer, batch,
+            use_baseline=use_baseline,
+            max_grad_norm=max_grad_norm,
+            micro_batch_size=micro_batch_size,
+        )
+        logger.log({f"train/{k}": v for k, v in metrics.items()}, step=i + 1)
+        if log_every and (i % log_every == 0 or i == iterations - 1):
+            print(
+                f"[iter {i:>4}] return={metrics['mean_return']:+.3f} "
+                f"loss={metrics['loss']:+.4f} tokens={metrics['n_tokens']:.0f}"
+            )
+        yield batch, metrics
+
+
+def _reinforce_update(
+    model,
+    optimizer: torch.optim.Optimizer,
+    batch: List[Rollout],
+    *,
+    use_baseline: bool,
+    max_grad_norm: float,
+    micro_batch_size: int,
+) -> Dict[str, float]:
+    returns = torch.tensor([r.total_reward for r in batch], dtype=torch.float32)
+    mean_r, std_r = returns.mean().item(), returns.std().item()
+    base = {"mean_return": mean_r, "std_return": std_r}
+
+    if use_baseline:
+        if std_r < 1e-6:
+            # Constant return across the batch -> zero advantages.
+            return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
+        weights = returns - returns.mean()
+    else:
+        weights = returns
+
+    # One training sequence per env step: (token_ids, action_mask, weight).
+    seqs = []
+    for w, r in zip(weights.tolist(), batch):
+        for s in r.steps:
+            if s.token_ids and s.action_mask and any(s.action_mask):
+                seqs.append((s.token_ids, s.action_mask, w))
+    if not seqs:
+        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
+
+    total_action_tokens = sum(sum(mask) for _, mask, _ in seqs)
+    total_loss = 0.0
+    model.train()
+    optimizer.zero_grad()
+    for i in range(0, len(seqs), micro_batch_size):
+        loss = _reinforce_microbatch_loss(
+            model, seqs[i : i + micro_batch_size], total_action_tokens
+        )
+        loss.backward()
+        total_loss += loss.item()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    optimizer.step()
+
+    return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
+            "skipped": 0.0}
