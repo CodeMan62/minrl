@@ -9,12 +9,15 @@ from minrl.interaction import episode
 from minrl.loggers import Logger
 from minrl.types import Rollout
 from minrl.training.loss import (
+    _dpo_batch_loss,
     _grpo_microbatch_loss,
     _reinforce_microbatch_loss,
     _sft_batch_loss,
 )
 
 Example = Dict[str, List[int]]
+# One preference pair: {"chosen": Example, "rejected": Example} -- prompt +
+DPOExample = Dict[str, Example]
 
 
 # --------------------------------------------------------------------------
@@ -312,3 +315,81 @@ def _reinforce_update(
 
     return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
             "skipped": 0.0}
+
+
+# --------------------------------------------------------------------------
+# DPO
+# --------------------------------------------------------------------------
+
+def dpo(
+    model,
+    ref_model,
+    dataset: List[DPOExample],
+    *,
+    epochs: int = 1,
+    micro_batch_size: int = 4,
+    lr: float = 1e-6,
+    beta: float = 0.1,
+    max_grad_norm: float = 1.0,
+    log_every: int = 10,
+    shuffle: bool = True,
+    seed: int = 0,
+    logger: Optional[Logger] = None,
+) -> Iterator[Dict[str, float]]:
+    """Direct Preference Optimization over a dataset of preference pairs.
+
+    Each example is ``{"chosen": {"token_ids": [...], "action_mask": [...]},
+    "rejected": {...}}`` -- the same shape as an SFT example, once per side.
+    ``ref_model`` should be a frozen copy of the policy DPO starts from (e.g.
+    the SFT checkpoint); it is only ever read under ``torch.no_grad()`` and is
+    never updated. Yields one metrics dict per optimizer step.
+    """
+    if not dataset:
+        raise ValueError("dpo got an empty dataset.")
+    dataset = list(dataset)
+    logger = logger or Logger()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    rng = random.Random(seed)
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad_(False)
+
+    step = 0
+    for epoch in range(epochs):
+        order = list(range(len(dataset)))
+        if shuffle:
+            rng.shuffle(order)
+        for i in range(0, len(order), micro_batch_size):
+            batch = [dataset[j] for j in order[i : i + micro_batch_size]]
+            metrics = _dpo_update(
+                model, ref_model, optimizer, batch, beta, max_grad_norm
+            )
+            step += 1
+            metrics["epoch"] = float(epoch)
+            logger.log({f"dpo/{k}": v for k, v in metrics.items()}, step=step)
+            if log_every and step % log_every == 0:
+                print(
+                    f"[epoch {epoch} step {step:>5}] "
+                    f"loss={metrics['loss']:.4f} acc={metrics['accuracy']:.3f} "
+                    f"margin={metrics['margin']:+.3f}"
+                )
+            yield metrics
+
+
+def _dpo_update(
+    model,
+    ref_model,
+    optimizer: torch.optim.Optimizer,
+    batch: List[DPOExample],
+    beta: float,
+    max_grad_norm: float,
+) -> Dict[str, float]:
+    """One optimizer step on a single micro-batch."""
+    model.train()
+    ref_model.eval()
+    optimizer.zero_grad()
+    loss, accuracy, margin = _dpo_batch_loss(model, ref_model, batch, beta)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    optimizer.step()
+    return {"loss": loss.item(), "accuracy": accuracy, "margin": margin}
