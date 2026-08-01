@@ -40,7 +40,7 @@ from minrl.inference.chat_template import ChatTemplate  # noqa: E402
 from minrl.inference.hf import HFClient  # noqa: E402
 from minrl.inference.parser import MoveParser  # noqa: E402
 from minrl.interaction import episode  # noqa: E402
-from minrl.algorithms import grpo  # noqa: E402
+from minrl.training.algorithms import grpo  # noqa: E402
 from minrl.loggers import WandbLogger  # noqa: E402
 
 SYSTEM_PROMPT = (

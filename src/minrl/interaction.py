@@ -60,4 +60,4 @@ class SingleAgentProtocol(InteractionProtocol):
 
     def run(self) -> List[Rollout]:
         self.agent.reset()
-        return [rollout(self.agent, self.env, self.num_steps)]
+        return [episode(self.agent, self.env, self.num_steps)]

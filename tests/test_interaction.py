@@ -11,7 +11,7 @@ from minrl.envs.singleagent import SingleAgentEnv
 from minrl.interaction import (
     InteractionProtocol,
     SingleAgentProtocol,
-    rollout,
+    episode,
 )
 from minrl.types import Info, Observation, Rollout, StepOutPut
 
@@ -97,8 +97,8 @@ def test_token_trace_captured_from_agent():
     assert r.steps[0].action_mask == [1, 1, 1]
 
 
-def test_free_rollout_function_matches_protocol():
-    # SingleAgentProtocol.run() should wrap the same rollout() body.
-    r = rollout(ConstantAgent(), CountingEnv(3), 4)
+def test_free_episode_function_matches_protocol():
+    # SingleAgentProtocol.run() should wrap the same episode() body.
+    r = episode(ConstantAgent(), CountingEnv(3), 4)
     assert len(r.steps) == 4
     assert r.index == 4

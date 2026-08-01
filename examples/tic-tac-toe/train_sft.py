@@ -14,7 +14,7 @@ from minrl.agents.llm_agent import LLMAgent  # noqa: E402
 from minrl.inference.chat_template import ChatTemplate  # noqa: E402
 from minrl.inference.hf import HFClient  # noqa: E402
 from minrl.inference.parser import MoveParser  # noqa: E402
-from minrl.algorithms import sft  # noqa: E402
+from minrl.training.algorithms import sft  # noqa: E402
 from minrl.interaction import episode  # noqa: E402
 
 SYSTEM_PROMPT = (
