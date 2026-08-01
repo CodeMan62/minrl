@@ -11,6 +11,18 @@ class Parser(ABC):
         ...
 
 
+class TextParser(Parser):
+    """Identity parser: the action *is* the raw completion text.
+
+    Pairs with :class:`~minrl.envs.qa.QAEnv`, whose ``step()`` scores the
+    completion itself (e.g. extracting a numeric answer) rather than a
+    structured action parsed out of it.
+    """
+
+    def parse(self, text: str) -> str:
+        return text or ""
+
+
 class MoveParser(Parser):
     """Extract a single TicTacToe move (cell index ``0..8``) from a completion.
 
