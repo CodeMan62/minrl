@@ -393,3 +393,96 @@ def _dpo_update(
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     optimizer.step()
     return {"loss": loss.item(), "accuracy": accuracy, "margin": margin}
+
+# --------------------------------------------------------------------------
+# Dr. GRPO
+# --------------------------------------------------------------------------
+
+def dr_grpo(
+    model,
+    agent: BaseAgent,
+    env: env,
+    *,
+    iterations: int = 200,
+    group_size: int = 8,
+    max_episode_steps: int = 16,
+    max_tokens: int = 512,
+    lr: float = 5e-6,
+    clip_eps: float = 0.2,
+    max_grad_norm: float = 1.0,
+    micro_batch_size: int = 4,
+    log_every: int = 1,
+    logger: Optional[Logger] = None,
+) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
+    logger = logger or Logger()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    norm_constant = group_size * max_tokens
+    for i in range(iterations):
+        group = []
+        for _ in range(group_size):
+            agent.reset()
+            group.append(episode(agent, env, max_episode_steps))
+        metrics = _dr_grpo_update(
+            model, optimizer, group,
+            clip_eps=clip_eps,
+            max_grad_norm=max_grad_norm,
+            micro_batch_size=micro_batch_size,
+            norm_constant=norm_constant,
+        )
+        logger.log({f"train/{k}": v for k, v in metrics.items()}, step=i + 1)
+        if log_every and (i % log_every == 0 or i == iterations - 1):
+            print(
+                f"[iter {i:>4}] return={metrics['mean_return']:+.3f} "
+                f"loss={metrics['loss']:+.4f} tokens={metrics['n_tokens']:.0f}"
+            )
+        yield group, metrics
+
+
+def _dr_grpo_update(
+    model,
+    optimizer: torch.optim.Optimizer,
+    group: List[Rollout],
+    *,
+    clip_eps: float,
+    max_grad_norm: float,
+    micro_batch_size: int,
+    norm_constant: int,
+) -> Dict[str, float]:
+    returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
+    mean_r, std_r = returns.mean().item(), returns.std().item()
+    base = {"mean_return": mean_r, "std_return": std_r}
+
+    if std_r < 1e-6:
+        # Every episode got the same return -> all advantages are zero.
+        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
+    # Unlike GRPO, no division by std_r: keeps low-variance groups from
+    # dominating the update.
+    advantages = returns - returns.mean()
+
+    # One training sequence per env step: (token_ids, behaviour logprobs,
+    # action mask, episode advantage).
+    seqs = []
+    for adv, r in zip(advantages.tolist(), group):
+        for s in r.steps:
+            if s.token_ids and s.action_mask and any(s.action_mask):
+                seqs.append((s.token_ids, s.logprobs, s.action_mask, adv))
+    if not seqs:
+        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
+
+    total_action_tokens = sum(sum(mask) for _, _, mask, _ in seqs)
+    total_loss = 0.0
+    model.train()
+    optimizer.zero_grad()
+    for i in range(0, len(seqs), micro_batch_size):
+        # Fixed constant normalizer (not total_action_tokens): removes the
+        # response-length bias GRPO's per-batch token count introduces.
+        loss = _grpo_microbatch_loss(
+            model, seqs[i : i + micro_batch_size], norm_constant, clip_eps
+        )
+        loss.backward()
+        total_loss += loss.item()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    optimizer.step()
+
+    return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
+            "skipped": 0.0}
