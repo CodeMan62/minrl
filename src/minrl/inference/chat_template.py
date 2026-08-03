@@ -25,6 +25,7 @@ class HFChatTemplate:
             messages,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
+            **self.template_kwargs,
         )
         prompt_ids = list(getattr(out, "input_ids", out))
         prompt_text = self.tokenizer.decode(prompt_ids)

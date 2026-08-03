@@ -9,6 +9,7 @@ from minrl.interaction import episode
 from minrl.loggers import Logger
 from minrl.types import Rollout
 from minrl.training.loss import (
+    _cispo_microbatch_loss,
     _dpo_batch_loss,
     _grpo_microbatch_loss,
     _reinforce_microbatch_loss,
@@ -483,6 +484,94 @@ def _dr_grpo_update(
         total_loss += loss.item()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     optimizer.step()
+    return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
+            "skipped": 0.0}
 
+
+# --------------------------------------------------------------------------
+# CISPO
+# --------------------------------------------------------------------------
+
+def cispo(
+    model,
+    agent: BaseAgent,
+    env: env,
+    *,
+    iterations: int = 200,
+    group_size: int = 8,
+    max_episode_steps: int = 16,
+    lr: float = 5e-6,
+    eps_low: float = 0.2,
+    eps_high: float = 4.0,
+    max_grad_norm: float = 1.0,
+    micro_batch_size: int = 4,
+    log_every: int = 1,
+    logger: Optional[Logger] = None,
+) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
+    logger = logger or Logger()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    for i in range(iterations):
+        group = []
+        for _ in range(group_size):
+            agent.reset()
+            group.append(episode(agent, env, max_episode_steps))
+        metrics = _cispo_update(
+            model, optimizer, group,
+            eps_low=eps_low,
+            eps_high=eps_high,
+            max_grad_norm=max_grad_norm,
+            micro_batch_size=micro_batch_size,
+        )
+        logger.log({f"train/{k}": v for k, v in metrics.items()}, step=i + 1)
+        if log_every and (i % log_every == 0 or i == iterations - 1):
+            print(
+                f"[iter {i:>4}] return={metrics['mean_return']:+.3f} "
+                f"loss={metrics['loss']:+.4f} tokens={metrics['n_tokens']:.0f}"
+            )
+        yield group, metrics
+
+
+def _cispo_update(
+    model,
+    optimizer: torch.optim.Optimizer,
+    group: List[Rollout],
+    *,
+    eps_low: float,
+    eps_high: float,
+    max_grad_norm: float,
+    micro_batch_size: int,
+) -> Dict[str, float]:
+    returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
+    mean_r, std_r = returns.mean().item(), returns.std().item()
+    base = {"mean_return": mean_r, "std_return": std_r}
+
+    if std_r < 1e-6:
+        # Every episode got the same return -> all advantages are zero.
+        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
+    advantages = (returns - returns.mean()) / (returns.std() + 1e-6)
+
+    # One training sequence per env step: (token_ids, behaviour logprobs,
+    # action mask, episode advantage).
+    seqs = []
+    for adv, r in zip(advantages.tolist(), group):
+        for s in r.steps:
+            if s.token_ids and s.action_mask and any(s.action_mask):
+                seqs.append((s.token_ids, s.logprobs, s.action_mask, adv))
+    if not seqs:
+        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
+
+    total_action_tokens = sum(sum(mask) for _, _, mask, _ in seqs)
+    total_loss = 0.0
+    model.train()
+    optimizer.zero_grad()
+    for i in range(0, len(seqs), micro_batch_size):
+        loss = _cispo_microbatch_loss(
+            model, seqs[i : i + micro_batch_size], total_action_tokens,
+            eps_low, eps_high,
+        )
+        loss.backward()
+        total_loss += loss.item()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    optimizer.step()
     return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
             "skipped": 0.0}
