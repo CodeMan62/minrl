@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from enviornments import TicTacToe  # noqa: E402
 
 from minrl.agents.llm_agent import LLMAgent  # noqa: E402
-from minrl.inference.chat_template import ChatTemplate  # noqa: E402
+from minrl.inference.chat_template import HFChatTemplate  # noqa: E402
 from minrl.inference.hf import HFClient  # noqa: E402
 from minrl.inference.parser import MoveParser  # noqa: E402
 from minrl.interaction import episode  # noqa: E402
@@ -132,7 +132,7 @@ def main() -> None:
     client = HFClient(model, tokenizer)
     # enable_thinking=False: Qwen3 answers directly instead of spending the
     # token budget on a <think> block.
-    template = ChatTemplate(args.model, template_kwargs={"enable_thinking": False})
+    template = HFChatTemplate(tokenizer, template_kwargs={"enable_thinking": False})
     parser = MoveParser()
     env = TicTacToe()
 

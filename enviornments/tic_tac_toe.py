@@ -3,7 +3,7 @@ import random
 from minrl.envs.singleagent import SingleAgentEnv
 from minrl.types import StepOutPut, Observation, Info, Rollout
 from minrl.agents.agent import BaseAgent
-from minrl.interaction import rollout
+from minrl.interaction import episode
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -191,7 +191,7 @@ class MockAgent(BaseAgent):
 if __name__ == "__main__":
     env = TicTacToe()
     agent = MockAgent()
-    result = rollout(agent, env, 10)
+    result = episode(agent, env, 10)
 
     from pprint import pprint
 

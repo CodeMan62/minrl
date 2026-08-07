@@ -1,7 +1,7 @@
 from typing import List, Optional
 
 from minrl.agents.agent import BaseAgent
-from minrl.inference.chat_template import ChatTemplate, Message
+from minrl.inference.chat_template import HFChatTemplate, Message
 from minrl.inference.client import InferenceClient
 from minrl.inference.parser import Parser
 
@@ -10,7 +10,7 @@ class LLMAgent(BaseAgent):
     def __init__(
         self,
         client: InferenceClient,
-        template: ChatTemplate,
+        template: HFChatTemplate,
         parser: Parser,
         *,
         system_prompt: Optional[str] = None,
@@ -47,14 +47,15 @@ class LLMAgent(BaseAgent):
 
     def act(self, obs: str) -> Optional[int]:
         messages = self._build_messages(obs)
-        prompt_ids = self.template.encode(messages, add_generation_prompt=True)
+        prompt_ids = self.template.apply(messages, add_generation_prompt=True).prompt_ids
 
+        eos_token_id = self.template.tokenizer.eos_token_id
         resp = self.client.complete_tokens(
             prompt_ids,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             top_p=self.top_p,
-            stop_token_ids=self.template.stop_token_ids,
+            stop_token_ids=[eos_token_id] if eos_token_id is not None else None,
         )
         completion_ids = resp.token_idx
 
