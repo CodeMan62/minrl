@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local wandb run cache (synced to wandb.ai already)
+wandb/

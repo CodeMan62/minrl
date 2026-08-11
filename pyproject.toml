@@ -16,3 +16,16 @@ examples = [
     "peft>=0.14",
     "datasets>=3.0",
 ]
+
+[dependency-groups]
+bench = [
+    "accelerate>=1.14.0",
+    "datasets>=5.0.1",
+    "trl>=1.9.2",
+]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
