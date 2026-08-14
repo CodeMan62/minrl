@@ -145,7 +145,7 @@ Start a server (the flag is required so the sampled token *ids* can be
 recovered for training):
 
 ```bash
-vllm serve Qwen/Qwen3-0.6B --port 8000 --return-tokens-as-token-ids
+uv run vllm_server Qwen/Qwen3-0.6B
 ```
 
 Then:

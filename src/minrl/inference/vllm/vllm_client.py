@@ -20,7 +20,7 @@ class VLLMClient(InferenceClient):
     ``logprobs.tokens`` field carries ``"token_id:<id>"`` strings instead of the
     decoded text; otherwise we cannot recover the exact ids to train on. e.g.::
 
-        vllm serve Qwen/Qwen3-0.6B --return-tokens-as-token-ids
+        uv run vllm_server Qwen/Qwen3-0.6
     """
 
     def __init__(self, base_url: str, model: str, api_key: str = "local"):
