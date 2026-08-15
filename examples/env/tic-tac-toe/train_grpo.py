@@ -10,11 +10,11 @@ trained model, so every rollout is exactly on-policy with no weight syncing.
 
 Run (needs a GPU box; ~1.2GB of bf16 weights + optimizer states):
 
-    python examples/tic-tac-toe/train_grpo.py
+    python examples/env/tic-tac-toe/train_grpo.py
 
 Useful knobs:
 
-    python examples/tic-tac-toe/train_grpo.py \
+    python examples/env/tic-tac-toe/train_grpo.py \
         --iterations 150 --group-size 8 --lr 5e-6 \
         --eval-every 25 --eval-games 50 \
 
@@ -31,7 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, TaskType, get_peft_model
 # Repo root on sys.path so the top-level ``enviornments`` package resolves
 # regardless of the cwd this script is launched from.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from enviornments import TicTacToe  # noqa: E402
 

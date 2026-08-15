@@ -1,13 +1,11 @@
 # TicTacToe examples
 
-Two examples of using minrl with an LLM playing `TicTacToe` (from the
-top-level `enviornments/` package) against a random opponent.
+minrl using an LLM playing `TicTacToe` (from the top-level
+`enviornments/` package) against a random opponent.
 
 | File | What it does |
 |---|---|
 | `train_grpo.py` | Trains Qwen3-0.6B with GRPO so its win rate vs the random opponent goes up. |
-| `generate_sft_data.py` | Rejection-samples SFT data: plays games, keeps only the ones the model won, and writes each winning move as a demonstration to `sft_data.jsonl`. |
-| `train_sft.py` | Supervised fine-tuning on that data — the model imitates its own winning moves. Same win-rate eval as GRPO, so you can chain SFT → GRPO. |
 | `tic-tac-toe-vllm.py` | Single inference call against a vLLM server; prints the token trace (ids, logprobs, action mask) the trainer consumes. Sanity-check for the vLLM path, no training. |
 
 ## Prerequisites
@@ -28,7 +26,7 @@ itself is just a client.
 ## Train with GRPO
 
 ```bash
-python examples/tic-tac-toe/train_grpo.py
+python examples/env/tic-tac-toe/train_grpo.py
 ```
 
 Defaults: 150 iterations, 8 episodes per GRPO group, lr 5e-6, win-rate eval
@@ -38,7 +36,7 @@ end. Expect roughly 15–30 min on a modern GPU.
 Common knobs:
 
 ```bash
-python examples/tic-tac-toe/train_grpo.py \
+python examples/env/tic-tac-toe/train_grpo.py \
     --iterations 150 --group-size 8 --lr 5e-6 \
     --eval-every 25 --eval-games 50 --device cuda
 ```
@@ -48,7 +46,7 @@ If the win rate climbs too slowly, try `--lr 1e-5` and/or `--group-size 16`.
 CPU smoke run (minutes, just to verify the loop executes):
 
 ```bash
-python examples/tic-tac-toe/train_grpo.py \
+python examples/env/tic-tac-toe/train_grpo.py \
     --iterations 2 --group-size 2 --eval-games 4 --device cpu
 ```
 
@@ -60,23 +58,6 @@ Notes:
   ends on an illegal move).
 - A `loss=0 ... skipped` iteration means every episode in the group got the
   same return, so all advantages are zero — normal at small group sizes.
-
-## Warm-start with SFT (rejection sampling)
-
-Before GRPO, you can teach the model the format and basic competence by
-imitation. Rejection sampling generates the demonstrations from the model
-itself: sample games, throw away the losses, and keep every move from the
-games it *won*. SFT then maximizes the log-probability of those moves — the
-same masked next-token loss as GRPO, minus the advantage/clip machinery.
-
-```bash
-python examples/tic-tac-toe/generate_sft_data.py --num-examples 500   # -> sft_data.jsonl
-python examples/tic-tac-toe/train_sft.py --epochs 3 --lr 1e-5
-```
-
-The base model must win *sometimes* for this to yield data; if it rarely does,
-raise `--max-games`/`--temperature` or pass `--keep-draws`. The resulting
-checkpoint is a solid starting point for `train_grpo.py`.
 
 ## Tracking training with W&B
 
@@ -106,7 +87,7 @@ wandb login              # paste your API key from https://wandb.ai/authorize
 Then just run training as usual — the run URL is printed at start and end:
 
 ```bash
-python examples/tic-tac-toe/train_grpo.py
+python examples/env/tic-tac-toe/train_grpo.py
 # W&B run: https://wandb.ai/<your-entity>/minrl-tictactoe/runs/<run-id>
 ```
 
@@ -128,15 +109,15 @@ Useful variants:
 
 ```bash
 # name the run / use a different project
-python examples/tic-tac-toe/train_grpo.py \
+python examples/env/tic-tac-toe/train_grpo.py \
     --wandb-run-name qwen3-0.6b-lr5e-6 --wandb-project my-project
 
 # no internet on the training box: log offline, sync later
-WANDB_MODE=offline python examples/tic-tac-toe/train_grpo.py
+WANDB_MODE=offline python examples/env/tic-tac-toe/train_grpo.py
 wandb sync wandb/offline-run-*        # from the same directory, once online
 
 # disable W&B entirely
-python examples/tic-tac-toe/train_grpo.py --no-wandb
+python examples/env/tic-tac-toe/train_grpo.py --no-wandb
 ```
 
 ## vLLM inference check
@@ -151,8 +132,8 @@ uv run vllm_server Qwen/Qwen3-0.6B
 Then:
 
 ```bash
-python examples/tic-tac-toe/tic-tac-toe-vllm.py
+python examples/env/tic-tac-toe/tic-tac-toe-vllm.py
 # or point elsewhere:
 MINRL_BASE_URL=http://localhost:8000/v1 MINRL_MODEL=Qwen/Qwen3-0.6B \
-    python examples/tic-tac-toe/tic-tac-toe-vllm.py
+    python examples/env/tic-tac-toe/tic-tac-toe-vllm.py
 ```
