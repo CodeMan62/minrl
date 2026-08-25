@@ -49,12 +49,16 @@ class ChatResponse:
 #-------------------training types-----------------------
 
 @dataclass
+class Batch:
+    """One trainer step's worth of data.
+
+    Online RL fills ``rollouts``. Offline SFT/DPO fills ``examples``.
+    """
+    rollouts: Optional[List[Rollout]] = None
+    examples: Optional[List[Any]] = None
+    meta: Dict[str, JSON] = field(default_factory=dict)
+
+
 class BatchSource:
     def next_batch(self) -> Batch:
-        ...
-class Batch:
-    input_ids: List[int]
-    attention_mask: List[int]
-    action_mask: List[int]
-    weights: float
-    meta: Dict[str, JSON]
+        raise NotImplementedError
