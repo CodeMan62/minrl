@@ -46,4 +46,15 @@ class ChatResponse:
     finish_reason: Optional[str] = None
 
 
+#-------------------training types-----------------------
 
+@dataclass
+class BatchSource:
+    def next_batch(self) -> Batch:
+        ...
+class Batch:
+    input_ids: List[int]
+    attention_mask: List[int]
+    action_mask: List[int]
+    weights: float
+    meta: Dict[str, JSON]

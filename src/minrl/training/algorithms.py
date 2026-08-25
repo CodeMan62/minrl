@@ -1,5 +1,5 @@
 import random
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -19,6 +19,57 @@ from minrl.training.loss import (
 Example = Dict[str, List[int]]
 # One preference pair: {"chosen": Example, "rejected": Example} -- prompt +
 DPOExample = Dict[str, Example]
+
+
+_LOSS_FNS: Dict[str, Callable[..., Any]] = {}
+_UPDATE_FNS: Dict[str, Callable[..., Any]] = {}
+
+
+def register_algorithm(
+    name: str,
+    *,
+    loss: Optional[Callable[..., Any]] = None,
+    update: Optional[Callable[..., Any]] = None,
+) -> None:
+    """Register loss/update callables under ``name`` (e.g. ``\"grpo\"``)."""
+    if loss is not None:
+        _LOSS_FNS[name] = loss
+    if update is not None:
+        _UPDATE_FNS[name] = update
+
+
+class Algorithm:
+    """Named algorithm handle used by ``Trainer``.
+
+    Algo-specific hparams (``clip_eps``, ``beta``, ...) go here — not on
+    ``TrainerConfig``. Implementations stay as free functions and are looked
+    up by ``name`` (``\"grpo\"``, ``\"dr_grpo\"``, ``\"sft\"``, ...).
+    """
+
+    def __init__(self, name: str, **hparams):
+        self.name = name
+        self.hparams = hparams
+
+    def loss(self, model, batch, **kwargs):
+        """Compute loss (+ optional stats). MISSING: wire per-algo loss fns."""
+        fn = _LOSS_FNS.get(self.name)
+        if fn is None:
+            raise NotImplementedError(
+                f"no loss registered for algorithm {self.name!r} — "
+                f"call register_algorithm({self.name!r}, loss=...)"
+            )
+        return fn(model, batch, **self.hparams, **kwargs)
+
+    def update(self, model, optimizer, batch, **kwargs) -> Dict[str, float]:
+        """Run one optimizer update on ``batch``. MISSING: wire per-algo updates."""
+        fn = _UPDATE_FNS.get(self.name)
+        if fn is None:
+            raise NotImplementedError(
+                f"no update registered for algorithm {self.name!r} — "
+                f"call register_algorithm({self.name!r}, update=...)"
+            )
+        return fn(model, optimizer, batch, **self.hparams, **kwargs)
+
 
 
 # --------------------------------------------------------------------------
