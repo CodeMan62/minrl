@@ -1,5 +1,5 @@
 import random
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -8,6 +8,7 @@ from minrl.envs.env import env
 from minrl.interaction import episode
 from minrl.loggers import Logger
 from minrl.types import Rollout
+from minrl.training.utils import batch_data, get_update, register
 from minrl.training.loss import (
     _cispo_microbatch_loss,
     _dpo_batch_loss,
@@ -21,55 +22,18 @@ Example = Dict[str, List[int]]
 DPOExample = Dict[str, Example]
 
 
-_LOSS_FNS: Dict[str, Callable[..., Any]] = {}
-_UPDATE_FNS: Dict[str, Callable[..., Any]] = {}
-
-
-def register_algorithm(
-    name: str,
-    *,
-    loss: Optional[Callable[..., Any]] = None,
-    update: Optional[Callable[..., Any]] = None,
-) -> None:
-    """Register loss/update callables under ``name`` (e.g. ``\"grpo\"``)."""
-    if loss is not None:
-        _LOSS_FNS[name] = loss
-    if update is not None:
-        _UPDATE_FNS[name] = update
-
-
 class Algorithm:
-    """Named algorithm handle used by ``Trainer``.
-
-    Algo-specific hparams (``clip_eps``, ``beta``, ...) go here — not on
-    ``TrainerConfig``. Implementations stay as free functions and are looked
-    up by ``name`` (``\"grpo\"``, ``\"dr_grpo\"``, ``\"sft\"``, ...).
-    """
+    """``Algorithm("grpo", clip_eps=0.2)`` → registered ``@register("grpo")`` update."""
 
     def __init__(self, name: str, **hparams):
         self.name = name
         self.hparams = hparams
-
-    def loss(self, model, batch, **kwargs):
-        """Compute loss (+ optional stats). MISSING: wire per-algo loss fns."""
-        fn = _LOSS_FNS.get(self.name)
-        if fn is None:
-            raise NotImplementedError(
-                f"no loss registered for algorithm {self.name!r} — "
-                f"call register_algorithm({self.name!r}, loss=...)"
-            )
-        return fn(model, batch, **self.hparams, **kwargs)
+        self._update = get_update(name)
 
     def update(self, model, optimizer, batch, **kwargs) -> Dict[str, float]:
-        """Run one optimizer update on ``batch``. MISSING: wire per-algo updates."""
-        fn = _UPDATE_FNS.get(self.name)
-        if fn is None:
-            raise NotImplementedError(
-                f"no update registered for algorithm {self.name!r} — "
-                f"call register_algorithm({self.name!r}, update=...)"
-            )
-        return fn(model, optimizer, batch, **self.hparams, **kwargs)
-
+        return self._update(
+            model, optimizer, batch_data(batch), **self.hparams, **kwargs
+        )
 
 
 # --------------------------------------------------------------------------
@@ -114,6 +78,7 @@ def grpo(
         yield group, metrics
 
 
+@register("grpo")
 def _grpo_update(
     model,
     optimizer: torch.optim.Optimizer,
@@ -122,6 +87,7 @@ def _grpo_update(
     clip_eps: float,
     max_grad_norm: float,
     micro_batch_size: int,
+    **_kwargs,
 ) -> Dict[str, float]:
     returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
     mean_r, std_r = returns.mean().item(), returns.std().item()
@@ -207,11 +173,13 @@ def sft(
             yield metrics
 
 
+@register("sft")
 def _sft_update(
     model,
     optimizer: torch.optim.Optimizer,
     batch: List[Example],
     max_grad_norm: float,
+    **_kwargs,
 ) -> Dict[str, float]:
     """One optimizer step on a single micro-batch."""
     model.train()
@@ -322,6 +290,7 @@ def _reinforce_loop(
         yield batch, metrics
 
 
+@register("reinforce")
 def _reinforce_update(
     model,
     optimizer: torch.optim.Optimizer,
@@ -330,6 +299,7 @@ def _reinforce_update(
     use_baseline: bool,
     max_grad_norm: float,
     micro_batch_size: int,
+    **_kwargs,
 ) -> Dict[str, float]:
     returns = torch.tensor([r.total_reward for r in batch], dtype=torch.float32)
     mean_r, std_r = returns.mean().item(), returns.std().item()
@@ -414,7 +384,8 @@ def dpo(
         for i in range(0, len(order), micro_batch_size):
             batch = [dataset[j] for j in order[i : i + micro_batch_size]]
             metrics = _dpo_update(
-                model, ref_model, optimizer, batch, beta, max_grad_norm
+                model, optimizer, batch,
+                ref_model=ref_model, beta=beta, max_grad_norm=max_grad_norm,
             )
             step += 1
             metrics["epoch"] = float(epoch)
@@ -428,13 +399,16 @@ def dpo(
             yield metrics
 
 
+@register("dpo")
 def _dpo_update(
     model,
-    ref_model,
     optimizer: torch.optim.Optimizer,
     batch: List[DPOExample],
+    *,
+    ref_model,
     beta: float,
     max_grad_norm: float,
+    **_kwargs,
 ) -> Dict[str, float]:
     """One optimizer step on a single micro-batch."""
     model.train()
@@ -490,6 +464,7 @@ def dr_grpo(
         yield group, metrics
 
 
+@register("dr_grpo")
 def _dr_grpo_update(
     model,
     optimizer: torch.optim.Optimizer,
@@ -499,6 +474,7 @@ def _dr_grpo_update(
     max_grad_norm: float,
     micro_batch_size: int,
     norm_constant: int,
+    **_kwargs,
 ) -> Dict[str, float]:
     returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
     mean_r, std_r = returns.mean().item(), returns.std().item()
@@ -582,6 +558,7 @@ def cispo(
         yield group, metrics
 
 
+@register("cispo")
 def _cispo_update(
     model,
     optimizer: torch.optim.Optimizer,
@@ -591,6 +568,7 @@ def _cispo_update(
     eps_high: float,
     max_grad_norm: float,
     micro_batch_size: int,
+    **_kwargs,
 ) -> Dict[str, float]:
     returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
     mean_r, std_r = returns.mean().item(), returns.std().item()
