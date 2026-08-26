@@ -3,6 +3,7 @@ from typing import Dict, Iterator, Optional
 from torch import nn
 import torch.optim as optim
 from minrl.loggers import Logger
+from minrl.training.algorithms import Algorithm
 from minrl.training.config import TrainerConfig
 from minrl.types import BatchSource
 
@@ -13,7 +14,7 @@ class Trainer:
         self,
         model: nn.Module,
         *,
-        algorithm,
+        algorithm: Algorithm,
         source: BatchSource,
         config: TrainerConfig,
         logger: Optional[Logger] = None,
@@ -36,11 +37,9 @@ class Trainer:
         )
 
     def train_step(self) -> Dict[str, float]:
-        """One RL/SFT step: sample batch → algorithm.update → stats."""
         batch = self.source.next_batch()
         self.model.train()
-        self.optimizer.zero_grad()
-        stats = self.algorithm.update(
+        return self.algorithm.update(
             self.model,
             self.optimizer,
             batch,
@@ -49,11 +48,8 @@ class Trainer:
             micro_batch_size=self.cfg.micro_batch_size,
             accum_steps=self.cfg.accum_steps,
         )
-        self.optimizer.step()
-        return stats
 
     def train(self, num_steps: int) -> Iterator[Dict[str, float]]:
-        """Train for ``num_steps``, yielding metrics (includes ``step``)."""
         prefix = self.cfg.log_prefix
         for step in range(1, num_steps + 1):
             stats = self.train_step()
