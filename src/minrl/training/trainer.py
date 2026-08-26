@@ -32,7 +32,7 @@ class Trainer:
         return optim.AdamW(self.model.parameters(),
          lr=self.cfg.lr,
          weight_decay=self.cfg.weight_decay,
-         betas=(self.cfg.beta1, self.cfg.beta2),
+         betas=self.cfg.betas,
          eps=self.cfg.eps
         )
 

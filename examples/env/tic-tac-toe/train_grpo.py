@@ -8,7 +8,7 @@ each group of episodes, and the win rate vs the random opponent is evaluated
 Inference runs *in-process* through ``HFClient`` — the sampled model IS the
 trained model, so every rollout is exactly on-policy with no weight syncing.
 
-Run (needs a GPU box; ~1.2GB of bf16 weights + optimizer states):
+Single-GPU::
 
     python examples/env/tic-tac-toe/train_grpo.py
 
@@ -40,8 +40,11 @@ from minrl.inference.chat_template import HFChatTemplate  # noqa: E402
 from minrl.inference.hf import HFClient  # noqa: E402
 from minrl.inference.parser import MoveParser  # noqa: E402
 from minrl.interaction import episode  # noqa: E402
-from minrl.training.algorithms import grpo  # noqa: E402
 from minrl.loggers import WandbLogger  # noqa: E402
+from minrl.training.algorithms import Algorithm  # noqa: E402
+from minrl.training.config import TrainerConfig  # noqa: E402
+from minrl.training.sources import RolloutSource  # noqa: E402
+from minrl.training.trainer import Trainer  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are playing Tic-Tac-Toe against an opponent. Cells are numbered 0-8, "
@@ -58,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--max-new-tokens", type=int, default=8)
     p.add_argument("--micro-batch-size", type=int, default=4)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-games", type=int, default=50)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -146,16 +151,28 @@ def main() -> None:
 
     logger = make_logger(args)
 
-    # grpo() logs train/* metrics (mean_return, loss, ...) each step by
-    # itself; this script adds the env-specific extras and eval/* on top.
-    training = grpo(
-        model, train_agent, env,
-        iterations=args.iterations,
-        group_size=args.group_size,
-        max_episode_steps=9,          # a TicTacToe game is at most 5 own moves
+    cfg = TrainerConfig(
         lr=args.lr,
         micro_batch_size=args.micro_batch_size,
-        log_every=0,                  # this script prints its own line per iter
+        max_grad_norm=args.max_grad_norm,
+        seed=args.seed,
+        strategy="none",
+        mixed_precision="bf16",
+        log_prefix="train",
+        log_every=1,
+    )
+
+    source = RolloutSource(
+        train_agent,
+        env,
+        batch_size=args.group_size,
+        max_episode_steps=9,
+    )
+    trainer = Trainer(
+        model,
+        algorithm=Algorithm("grpo", clip_eps=args.clip_eps),
+        source=source,
+        config=cfg,
         logger=logger,
     )
 
@@ -168,27 +185,19 @@ def main() -> None:
     log_eval(0, baseline)
 
     evals = [(0, baseline)]
-    for i, (group, metrics) in enumerate(training):
-        wins = sum(1 for r in group if r.steps[-1].info.get("result") == "win")
-        illegal = sum(1 for r in group if r.steps[-1].info.get("illegal_move"))
+    for metrics in trainer.train(num_steps=args.iterations):
+        step = int(metrics["step"])
         print(
-            f"[iter {i + 1:>4}/{args.iterations}] "
-            f"return={metrics['mean_return']:+.2f} loss={metrics['loss']:+.4f} "
-            f"train W/illegal={wins}/{illegal} of {len(group)}"
+            f"[iter {step:>4}/{args.iterations}] "
+            f"return={metrics.get('mean_return', float('nan')):+.2f} "
+            f"loss={metrics.get('loss', float('nan')):+.4f} "
+            f"tokens={metrics.get('n_tokens', 0):.0f}"
         )
-        if logger:
-            logger.log(
-                {
-                    "train/win_rate": wins / len(group),
-                    "train/illegal_rate": illegal / len(group),
-                },
-                step=i + 1,
-            )
-        if (i + 1) % args.eval_every == 0 and (i + 1) < args.iterations:
+        if step % args.eval_every == 0 and step < args.iterations:
             e = evaluate(eval_agent, env, args.eval_games)
-            evals.append((i + 1, e))
-            print(fmt_eval(f"[eval] after iter {i + 1}", e))
-            log_eval(i + 1, e)
+            evals.append((step, e))
+            print(fmt_eval(f"[eval] after iter {step}", e))
+            log_eval(step, e)
 
     final = evaluate(eval_agent, env, args.eval_games)
     evals.append((args.iterations, final))
