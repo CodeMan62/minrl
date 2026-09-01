@@ -1,5 +1,4 @@
-
-
+import argparse
 from typing import Dict, Optional
 
 
@@ -38,3 +37,18 @@ class WandbLogger(Logger):
 
     def finish(self) -> None:
         self.run.finish()
+# so i dont' have to write it again and again
+def make_logger(args: argparse.Namespace):
+    if args.no_wandb:
+        return None
+    try:
+        logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+        )
+    except ImportError:
+        print("wandb not installed - skipping w&b loggging")
+        return None
+    print(f"W&B run: {logger.url}")
+    return logger

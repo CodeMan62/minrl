@@ -40,7 +40,7 @@ from minrl.inference.chat_template import HFChatTemplate  # noqa: E402
 from minrl.inference.hf import HFClient  # noqa: E402
 from minrl.inference.parser import MoveParser  # noqa: E402
 from minrl.interaction import episode  # noqa: E402
-from minrl.loggers import WandbLogger  # noqa: E402
+from minrl.loggers import WandbLogger, make_logger  # noqa: E402
 from minrl.training.algorithms import Algorithm  # noqa: E402
 from minrl.training.config import TrainerConfig  # noqa: E402
 from minrl.training.sources import RolloutSource  # noqa: E402
@@ -77,22 +77,6 @@ def parse_args() -> argparse.Namespace:
                    help="optional run name (W&B generates one if omitted)")
     return p.parse_args()
 
-
-def make_logger(args: argparse.Namespace):
-    """Start a W&B run, or return None (with a note) if unavailable/disabled."""
-    if args.no_wandb:
-        return None
-    try:
-        logger = WandbLogger(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
-        )
-    except ImportError:
-        print("wandb not installed — skipping W&B logging (pip install wandb)")
-        return None
-    print(f"W&B run: {logger.url}")
-    return logger
 
 
 def evaluate(agent: LLMAgent, env: TicTacToe, games: int) -> dict:
