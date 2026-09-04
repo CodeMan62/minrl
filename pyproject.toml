@@ -8,7 +8,7 @@ dependencies = [
     "torch>=2.12.1",
     "openai>=1.0",
     "transformers>=4.44",
-    "vllm">=0.28.0",
+    "vllm>=0.28.0",
 ]
 
 [project.scripts]
