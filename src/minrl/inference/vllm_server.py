@@ -71,6 +71,32 @@ async def run_server(args: Namespace) -> None:
             success = await request.app.state.engine_client.reset_prefix_cache()
             return {"success": bool(success)}
 
+        @router.post("/minrl/init_weight_sync")
+        async def minrl_init_weight_sync(request: Request):
+            body = await request.json()
+            await request.app.state.engine_client.collective_rpc(
+                "init_weight_sync",
+                kwargs={
+                    "master_address": body["master_address"],
+                    "master_port": int(body["master_port"]),
+                    "world_size": int(body["world_size"]),
+                },
+            )
+            return {"status": "ok"}
+
+        @router.post("/minrl/update_weights")
+        async def minrl_update_weights(request: Request):
+            body = await request.json()
+            await request.app.state.engine_client.collective_rpc(
+                "update_weights",
+                kwargs={
+                    "name": body["name"],
+                    "dtype": body["dtype"],
+                    "shape": body["shape"],
+                },
+            )
+            return {"status": "ok"}
+
         app.include_router(router)
 
         await init_app_state(engine_client, app.state, args, supported_tasks)
@@ -103,8 +129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ).parse_args()
     validate_parsed_serve_args(args)
     args.return_tokens_as_token_ids = True
-    if args.weight_transfer_config is None:
-        args.weight_transfer_config = {"backend": "nccl"}
+    args.worker_extension_cls = "minrl.inference.worker_extension.WeightSyncWorkerExtension"
 
     print(f"minrl: serving {args.model} on {args.host}:{args.port}", flush=True)
     uvloop.run(run_server(args))
