@@ -6,7 +6,6 @@ from minrl.loggers import Logger
 from minrl.training.algorithms import Algorithm
 from minrl.training.config import TrainerConfig
 from minrl.types import BatchSource
-from minrl.inference.weight_sync import WeightSyncWorkerExtension
 
 
 class Trainer:
@@ -20,7 +19,7 @@ class Trainer:
         config: TrainerConfig,
         logger: Optional[Logger] = None,
         ref_model: Optional[nn.Module] = None,
-        weight_synchronizer: WeightSyncWorkerExtension=None,
+        weight_synchronizer=None,
         sync_every: int = 1,
     ):
         self.model = model
@@ -59,8 +58,7 @@ class Trainer:
         for step in range(1, num_steps + 1):
             stats = self.train_step()
             if self.weight_synchronizer is not None and step % self.sync_every == 0:
-                for n, p in self.model.named_parameters():
-                    self.weight_synchronizer.sync(n, str(p.dtype).split(".")[-1], tuple(p.shape))
+                self.weight_synchronizer.send_weights()
             stats = {**stats, "step": float(step)}
             if self.logger and self.cfg.log_every and step % self.cfg.log_every == 0:
                 self.logger.log(

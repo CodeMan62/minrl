@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import signal
 from argparse import Namespace
 from typing import List, Optional, Sequence
 
@@ -22,6 +23,9 @@ from vllm.entrypoints.openai.api_server import (
     setup_server,
 )
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.usage.usage_lib import UsageContext
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -44,76 +48,64 @@ def build_serve_argv(model: str, extra: Sequence[str] = ()) -> List[str]:
 async def run_server(args: Namespace) -> None:
     """Serve ``args.model`` with vLLM's OpenAI-compatible app."""
     listen_address, sock = setup_server(args, reuse_port=False)
-    async with build_async_engine_client(args) as engine_client:
-        supported_tasks = await engine_client.get_supported_tasks()
-        app = build_app(args, supported_tasks, engine_client.model_config)
+    def signal_handler(*_) -> None:
+        raise KeyboardInterrupt
 
-        router = APIRouter()
+    signal.signal(signal.SIGTERM, signal_handler)
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    engine = AsyncLLMEngine.from_engine_args(
+        engine_args, usage_context=UsageContext.OPENAI_API_SERVER
+    )
+    app = build_app(args)
 
-        @router.get("/minrl/health")
-        async def minrl_health(request: Request):
-            try:
-                await request.app.state.engine_client.check_health()
-            except Exception as e:  # noqa: BLE001 - report as JSON
-                return JSONResponse(
-                    content={"status": "unhealthy", "error": str(e)},
-                    status_code=503,
-                )
-            return {"status": "ok"}
+    router = APIRouter()
 
-        @router.get("/minrl/weight_version")
-        async def minrl_weight_version(request: Request):
-            version = await request.app.state.engine_client.get_weight_version()
-            return {"weight_version": version}
+    @router.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
 
-        @router.post("/minrl/reset_prefix_cache")
-        async def minrl_reset_prefix_cache(request: Request):
-            success = await request.app.state.engine_client.reset_prefix_cache()
-            return {"success": bool(success)}
-
-        @router.post("/minrl/init_weight_sync")
-        async def minrl_init_weight_sync(request: Request):
-            body = await request.json()
-            await request.app.state.engine_client.collective_rpc(
-                "init_weight_sync",
-                kwargs={
-                    "master_address": body["master_address"],
-                    "master_port": int(body["master_port"]),
-                    "world_size": int(body["world_size"]),
-                },
-            )
-            return {"status": "ok"}
-
-        @router.post("/minrl/update_weights")
-        async def minrl_update_weights(request: Request):
-            body = await request.json()
-            await request.app.state.engine_client.collective_rpc(
-                "update_weights",
-                kwargs={
-                    "name": body["name"],
-                    "dtype": body["dtype"],
-                    "shape": body["shape"],
-                },
-            )
-            return {"status": "ok"}
-
-        app.include_router(router)
-
-        await init_app_state(engine_client, app.state, args, supported_tasks)
-        logger.info("minrl: starting server on %s", listen_address)
-        shutdown_task = await serve_http(
-            app,
-            sock=sock,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            access_log=not args.disable_uvicorn_access_log,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
+    @router.post("/init_communicator")
+    async def init_communicator(request: Request) -> dict[str, str]:
+        body = await request.json()
+        await engine.collective_rpc(
+            "init_communicator",
+            kwargs={
+                "host": body["host"],
+                "port": int(body["port"]),
+                "world_size": int(body["world_size"]),
+            },
         )
+        return {"status": "ok"}
+
+    @router.post("/update_weights")
+    async def update_weights(request: Request) -> dict[str, str]:
+        body = await request.json()
+        await engine.collective_rpc(
+            "sync",
+            kwargs={
+                "name": body["name"],
+                "dtype": body["dtype"],
+                "shape": body["shape"],
+            },
+        )
+        return {"status": "ok"}
+
+    app.include_router(router)
+
+    await init_app_state(engine, app.state, args)
+    shutdown_task = await serve_http(
+        app,
+        sock=sock,
+        host=args.host,
+        port=args.port,
+        log_level=args.uvicorn_log_level,
+        ssl_keyfile=args.ssl_keyfile,
+        ssl_certfile=args.ssl_certfile,
+        ssl_ca_certs=args.ssl_ca_certs,
+        ssl_cert_reqs=args.ssl_cert_reqs,
+    )
     await shutdown_task
     sock.close()
-
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     raw = list(sys.argv[1:] if argv is None else argv)
@@ -129,7 +121,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ).parse_args()
     validate_parsed_serve_args(args)
     args.return_tokens_as_token_ids = True
-    args.worker_extension_cls = "minrl.inference.worker_extension.WeightSyncWorkerExtension"
+    args.worker_extension_cls = "minrl.inference.weight_sync.WeightSyncWorkerExtension"
 
     print(f"minrl: serving {args.model} on {args.host}:{args.port}", flush=True)
     uvloop.run(run_server(args))
