@@ -24,17 +24,11 @@ import sys
 import torch
 import torch.distributed
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from vllm.distributed.weight_transfer import (
-    HTTPVLLMWeightSyncClient,
-    ModuleSource,
-    WeightTransferTrainerFactory,
-)
-from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerInitInfo
 
 from minrl.agents.llm_agent import LLMAgent
 from minrl.inference.chat_template import HFChatTemplate
 from minrl.inference.parser import TextParser
-from minrl.inference.vllm_client import VLLMClient
+from minrl.inference.vllm_client import VLLMClient, vllm_weight_synchronizer
 from minrl.loggers import make_logger
 from minrl.training import dist
 from minrl.training.algorithms import Algorithm
@@ -133,17 +127,9 @@ def main() -> None:
         temperature=0.0,
     )
 
-    # Trainer rank 0 is the sender (NCCL rank 0, the vLLM worker is rank 1);
-    # other ranks only join the gather of their FSDP shards.
-    synchronizer = WeightTransferTrainerFactory.trainer_init(
-        NCCLTrainerInitInfo(
-            master_address=args.weight_transfer_host,
-            master_port=args.weight_transfer_port,
-            world_size=2,
-            rank=rank,
-        ),
-        client=HTTPVLLMWeightSyncClient(args.vllm_url),
-        source=ModuleSource(model),  # FSDP shards in place, so this stays valid
+    synchronizer = vllm_weight_synchronizer(
+        model, args.vllm_url, host=args.weight_transfer_host,
+        port=args.weight_transfer_port, rank=rank,
     )
     logger = make_logger(args) if is_main else None
     trainer = Trainer(
