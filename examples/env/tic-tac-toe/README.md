@@ -14,11 +14,10 @@ minrl using an LLM playing `TicTacToe` (from the top-level
 - Internet access on first run to download `Qwen/Qwen3-0.6B` (~1.5 GB) from
   the HF Hub.
 
-**Hardware for `train_grpo.py`:** a GPU box. The model is loaded in bf16
-(~1.2 GB weights) plus AdamW states and activations — any 16 GB+ GPU is
-comfortable. There is no multi-GPU support; it runs on a single device.
-CPU works only for a tiny "does it move" smoke run (see below) — actual
-training on CPU is far too slow.
+**Hardware for `train_grpo.py`:** two GPUs. One serves the model with vLLM
+for rollouts; the other trains. After every optimizer step the trainer pushes
+its weights into the server over NCCL, so the server and trainer must share a
+host.
 
 `tic-tac-toe-vllm.py` needs whatever GPU your vLLM server runs on; the script
 itself is just a client.
@@ -26,7 +25,9 @@ itself is just a client.
 ## Train with GRPO
 
 ```bash
-python examples/env/tic-tac-toe/train_grpo.py
+CUDA_VISIBLE_DEVICES=0 vllm_server Qwen/Qwen3-0.6B \
+    --gpu-memory-utilization 0.7 --weight-transfer-config '{"backend":"nccl"}'
+CUDA_VISIBLE_DEVICES=1 python examples/env/tic-tac-toe/train_grpo.py
 ```
 
 Defaults: 150 iterations, 8 episodes per GRPO group, lr 5e-6, win-rate eval
@@ -38,22 +39,15 @@ Common knobs:
 ```bash
 python examples/env/tic-tac-toe/train_grpo.py \
     --iterations 150 --group-size 8 --lr 5e-6 \
-    --eval-every 25 --eval-games 50 --device cuda
+    --eval-every 25 --eval-games 50
 ```
 
 If the win rate climbs too slowly, try `--lr 1e-5` and/or `--group-size 16`.
 
-CPU smoke run (minutes, just to verify the loop executes):
-
-```bash
-python examples/env/tic-tac-toe/train_grpo.py \
-    --iterations 2 --group-size 2 --eval-games 4 --device cpu
-```
-
 Notes:
 
-- Inference runs in-process (`HFClient`), so the sampled model is literally
-  the trained model — fully on-policy, no weight syncing.
+- Rollouts come from the vLLM server; weights are synced after every step,
+  so each group is sampled from the current policy.
 - Rewards: +1 win, 0 draw, -1 loss, -1 illegal/unparseable move (the episode
   ends on an illegal move).
 - A `loss=0 ... skipped` iteration means every episode in the group got the

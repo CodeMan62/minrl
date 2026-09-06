@@ -1,25 +1,16 @@
-"""Train Qwen3-0.6B to play TicTacToe with GRPO, using only minrl.
+"""
+Start the server on GPU 0 first::
 
-The model plays full games against the env's random opponent. Episode return
-is +1 win / 0 draw / -1 loss / -1 illegal move, GRPO normalizes returns within
-each group of episodes, and the win rate vs the random opponent is evaluated
-(greedy decoding) before, during, and after training.
+    CUDA_VISIBLE_DEVICES=0 vllm_server Qwen/Qwen3-0.6B \\
+        --gpu-memory-utilization 0.7 \\
+        --weight-transfer-config '{"backend":"nccl"}'
 
-Inference runs *in-process* through ``HFClient`` — the sampled model IS the
-trained model, so every rollout is exactly on-policy with no weight syncing.
+Then train on GPU 1::
 
-Single-GPU::
+    CUDA_VISIBLE_DEVICES=1 python examples/env/tic-tac-toe/train_grpo.py
 
-    python examples/env/tic-tac-toe/train_grpo.py
-
-Useful knobs:
-
-    python examples/env/tic-tac-toe/train_grpo.py \
-        --iterations 150 --group-size 8 --lr 5e-6 \
-        --eval-every 25 --eval-games 50 \
-
-A CPU smoke run (tiny + slow, just to see it move): --iterations 2
---group-size 2 --eval-games 4 --device cpu
+After every optimizer step the trainer broadcasts its weights to vLLM, so the
+next group is sampled from the updated policy.
 """
 
 import argparse
@@ -28,23 +19,21 @@ import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-# Repo root on sys.path so the top-level ``enviornments`` package resolves
-# regardless of the cwd this script is launched from.
+
+from minrl.agents.llm_agent import LLMAgent
+from minrl.inference.chat_template import HFChatTemplate
+from minrl.inference.parser import MoveParser
+from minrl.inference.vllm_client import VLLMClient, vllm_weight_synchronizer
+from minrl.interaction import episode
+from minrl.loggers import make_logger
+from minrl.training.algorithms import Algorithm
+from minrl.training.config import TrainerConfig
+from minrl.training.sources import RolloutSource
+from minrl.training.trainer import Trainer
+
+# ``enviornments`` lives at the repo root and is not an installed package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-
 from enviornments import TicTacToe  # noqa: E402
-
-from minrl.agents.llm_agent import LLMAgent  # noqa: E402
-from minrl.config import LoRAConfig  # noqa: E402
-from minrl.inference.chat_template import HFChatTemplate  # noqa: E402
-from minrl.inference.hf import HFClient  # noqa: E402
-from minrl.inference.parser import MoveParser  # noqa: E402
-from minrl.interaction import episode  # noqa: E402
-from minrl.loggers import WandbLogger, make_logger  # noqa: E402
-from minrl.training.algorithms import Algorithm  # noqa: E402
-from minrl.training.config import TrainerConfig  # noqa: E402
-from minrl.training.sources import RolloutSource  # noqa: E402
-from minrl.training.trainer import Trainer  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are playing Tic-Tac-Toe against an opponent. Cells are numbered 0-8, "
@@ -56,27 +45,28 @@ SYSTEM_PROMPT = (
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    p.add_argument("--vllm-url", default="http://127.0.0.1:8000",
+                   help="vLLM server URL without /v1")
+    p.add_argument("--weight-transfer-host", default="127.0.0.1")
+    p.add_argument("--weight-transfer-port", type=int, default=29501)
     p.add_argument("--iterations", type=int, default=150)
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=5e-6)
+    p.add_argument("--adam-eps", type=float, default=1e-4)
     p.add_argument("--max-new-tokens", type=int, default=8)
     p.add_argument("--micro-batch-size", type=int, default=4)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-games", type=int, default=50)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--no-wandb", action="store_true",
-                   help="disable Weights & Biases logging")
+    p.add_argument("--wandb", dest="no_wandb", action="store_false")
+    p.add_argument("--no-wandb", dest="no_wandb", action="store_true")
     p.add_argument("--wandb-project", default="minrl-tictactoe")
-    p.add_argument("--lora-rank", type=int, default=8)
-    p.add_argument("--lora-dropout", type=float, default=0.0)
-    p.add_argument("--lora-alpha", type=int, default=32)
-    p.add_argument("--wandb-run-name", default=None,
-                   help="optional run name (W&B generates one if omitted)")
+    p.add_argument("--wandb-run-name", default=None)
+    p.set_defaults(no_wandb=True)
     return p.parse_args()
-
 
 
 def evaluate(agent: LLMAgent, env: TicTacToe, games: int) -> dict:
@@ -102,20 +92,20 @@ def fmt_eval(tag: str, e: dict) -> str:
 
 def main() -> None:
     args = parse_args()
+    if not torch.cuda.is_available() or not args.device.startswith("cuda"):
+        raise SystemExit("This example needs a CUDA training GPU.")
+    device = torch.device(args.device)
+    if device.index is not None:
+        torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
 
-    dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
-    print(f"loading {args.model} on {args.device} ({dtype}) ...")
-    base_model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
-    base_model.to(args.device)
-    model = LoRAConfig(
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-    ).apply(base_model)
+    print(f"loading {args.model} on {device} (float16) ...")
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
+    model.to(device)
+    model.config.use_cache = False
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    client = HFClient(model, tokenizer)
+    client = VLLMClient(f"{args.vllm_url.rstrip('/')}/v1", args.model)
     # enable_thinking=False: Qwen3 answers directly instead of spending the
     # token budget on a <think> block.
     template = HFChatTemplate(tokenizer, template_kwargs={"enable_thinking": False})
@@ -133,31 +123,27 @@ def main() -> None:
         max_tokens=args.max_new_tokens, temperature=0.0,
     )
 
+    synchronizer = vllm_weight_synchronizer(
+        model, args.vllm_url, host=args.weight_transfer_host, port=args.weight_transfer_port,
+    )
     logger = make_logger(args)
-
-    cfg = TrainerConfig(
-        lr=args.lr,
-        micro_batch_size=args.micro_batch_size,
-        max_grad_norm=args.max_grad_norm,
-        seed=args.seed,
-        strategy="none",
-        mixed_precision="bf16",
-        log_prefix="train",
-        log_every=1,
-    )
-
-    source = RolloutSource(
-        train_agent,
-        env,
-        batch_size=args.group_size,
-        max_episode_steps=9,
-    )
     trainer = Trainer(
         model,
         algorithm=Algorithm("grpo", clip_eps=args.clip_eps),
-        source=source,
-        config=cfg,
+        source=RolloutSource(train_agent, env, batch_size=args.group_size, max_episode_steps=9),
+        config=TrainerConfig(
+            lr=args.lr,
+            eps=args.adam_eps,
+            micro_batch_size=args.micro_batch_size,
+            max_grad_norm=args.max_grad_norm,
+            seed=args.seed,
+            strategy="none",
+            mixed_precision="fp16",
+            log_prefix="train",
+            log_every=1,
+        ),
         logger=logger,
+        weight_synchronizer=synchronizer,
     )
 
     def log_eval(step: int, e: dict) -> None:
@@ -183,6 +169,7 @@ def main() -> None:
             print(fmt_eval(f"[eval] after iter {step}", e))
             log_eval(step, e)
 
+    synchronizer.shutdown()
     final = evaluate(eval_agent, env, args.eval_games)
     evals.append((args.iterations, final))
     log_eval(args.iterations, final)
