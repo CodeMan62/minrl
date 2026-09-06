@@ -58,39 +58,10 @@ async def run_server(args: Namespace) -> None:
     )
     app = build_app(args)
 
-    router = APIRouter()
-
-    @router.get("/health")
+    @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @router.post("/init_communicator")
-    async def init_communicator(request: Request) -> dict[str, str]:
-        body = await request.json()
-        await engine.collective_rpc(
-            "init_communicator",
-            kwargs={
-                "host": body["host"],
-                "port": int(body["port"]),
-                "world_size": int(body["world_size"]),
-            },
-        )
-        return {"status": "ok"}
-
-    @router.post("/update_weights")
-    async def update_weights(request: Request) -> dict[str, str]:
-        body = await request.json()
-        await engine.collective_rpc(
-            "sync",
-            kwargs={
-                "name": body["name"],
-                "dtype": body["dtype"],
-                "shape": body["shape"],
-            },
-        )
-        return {"status": "ok"}
-
-    app.include_router(router)
 
     await init_app_state(engine, app.state, args)
     shutdown_task = await serve_http(

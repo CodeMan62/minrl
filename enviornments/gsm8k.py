@@ -5,6 +5,7 @@ import re
 from typing import Optional
 
 from minrl.envs.qa import QAEnv
+from minrl.interaction import episode
 
 GSM8K_SYSTEM_PROMPT = (
     "You are solving grade-school math word problems. Reason step by step, "
@@ -66,3 +67,15 @@ def GSM8K(
         shuffle=shuffle,
         seed=seed,
     )
+
+
+def evaluate_gsm8k(agent, env: QAEnv, samples: int) -> dict[str, float]:
+    env.rewind()
+    correct = truncated = 0
+    for _ in range(samples):
+        agent.reset()
+        r = episode(agent, env, max_steps=1)
+        correct += r.total_reward > 0
+        truncated += sum(r.steps[-1].action_mask or []) >= agent.max_tokens
+    return {"accuracy": correct / samples, "correct": float(correct),
+            "truncated": truncated / samples}
