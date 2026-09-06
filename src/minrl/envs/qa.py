@@ -55,6 +55,10 @@ class QAEnv(SingleAgentEnv):
         self.answer: Optional[str] = None
         self.is_done = True
 
+    def rewind(self) -> None:
+        """Start the question cycle over from the first pair."""
+        self._resets = 0
+
     def env_reset(self, seed: Optional[int] = None) -> Tuple[Observation, Info]:
         self._index = (self._resets // self.repeat) % len(self.pairs)
         self.question, self.answer = self.pairs[self._index]

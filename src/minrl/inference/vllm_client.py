@@ -4,6 +4,12 @@ from openai import OpenAI
 
 from minrl.inference.client import InferenceClient
 from minrl.types import ChatResponse
+from vllm.distributed.weight_transfer import (
+        HTTPVLLMWeightSyncClient,
+        ModuleSource,
+        WeightTransferTrainerFactory,
+    )
+from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerInitInfo
 
 # vLLM reports each logprob token as this string when the server is started
 # with ``--return-tokens-as-token-ids``; that is how we recover the sampled ids.
@@ -71,3 +77,19 @@ def _extract_tokens(logprobs) -> Tuple[List[int], List[float]]:
             )
         token_ids.append(int(tok[len(_TOKEN_ID_PREFIX):]))
     return token_ids, list(logprobs.token_logprobs)
+
+
+def vllm_weight_synchronizer(model, server_url: str, *, host: str = "127.0.0.1",
+                             port: int = 29501, rank: int = 0):
+    """NCCL weight sync from the trainer into a running ``vllm_server``.
+    The server must be started with ``--weight-transfer-config
+    '{"backend":"nccl"}'``. Trainer rank 0 is the sender (NCCL rank 0, the
+    vLLM worker is rank 1); other FSDP ranks only join the gather of their
+    shards, so every rank calls ``send_weights()`` after each optimizer step.
+    ``model`` may be sharded in place afterwards: parameters are read lazily.
+    """
+    return WeightTransferTrainerFactory.trainer_init(
+        NCCLTrainerInitInfo(master_address=host, master_port=port, world_size=2, rank=rank),
+        client=HTTPVLLMWeightSyncClient(server_url),
+        source=ModuleSource(model),
+    )
