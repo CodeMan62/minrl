@@ -9,12 +9,17 @@ Then train on GPU 1::
 
     CUDA_VISIBLE_DEVICES=1 python examples/env/tic-tac-toe/train_grpo.py
 
+or on GPUs 1-3 with FSDP2 (one rank per GPU, each playing its own games)::
+
+    CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 examples/env/tic-tac-toe/train_grpo.py
+
 After every optimizer step the trainer broadcasts its weights to vLLM, so the
 next group is sampled from the updated policy.
 """
 
 import argparse
 import os
+import random
 import sys
 
 import torch
@@ -26,7 +31,8 @@ from minrl.inference.parser import MoveParser
 from minrl.inference.vllm_client import VLLMClient, vllm_weight_synchronizer
 from minrl.interaction import episode
 from minrl.loggers import make_logger
-from minrl.training.algorithms import Algorithm
+from minrl.training import dist
+from minrl.training.algorithms import grpo
 from minrl.training.config import TrainerConfig
 from minrl.training.sources import RolloutSource
 from minrl.training.trainer import Trainer
@@ -59,8 +65,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-games", type=int, default=50)
-    p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--ckpt-dir", default="ckpts/tic-tac-toe")
+    p.add_argument("--ckpt-every", type=int, default=0, help="0 = only at the end")
+    p.add_argument("--resume", default=None, help="checkpoint dir to continue from")
     p.add_argument("--wandb", dest="no_wandb", action="store_false")
     p.add_argument("--no-wandb", dest="no_wandb", action="store_true")
     p.add_argument("--wandb-project", default="minrl-tictactoe")
@@ -92,14 +100,16 @@ def fmt_eval(tag: str, e: dict) -> str:
 
 def main() -> None:
     args = parse_args()
-    if not torch.cuda.is_available() or not args.device.startswith("cuda"):
+    device = dist.setup()
+    if device.type != "cuda":
         raise SystemExit("This example needs a CUDA training GPU.")
-    device = torch.device(args.device)
-    if device.index is not None:
-        torch.cuda.set_device(device)
-    torch.manual_seed(args.seed)
+    rank, main = dist.rank(), dist.is_main()
+    # Per-rank seed: each GPU plays its own games against the random opponent.
+    torch.manual_seed(args.seed + rank)
+    random.seed(args.seed + rank)
 
-    print(f"loading {args.model} on {device} (float16) ...")
+    if main:
+        print(f"loading {args.model} on {dist.world_size()} GPU(s) (float16) ...")
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
     model.to(device)
     model.config.use_cache = False
@@ -125,38 +135,46 @@ def main() -> None:
 
     synchronizer = vllm_weight_synchronizer(
         model, args.vllm_url, host=args.weight_transfer_host, port=args.weight_transfer_port,
+        rank=rank,
     )
-    logger = make_logger(args)
+    logger = make_logger(args) if main else None
     trainer = Trainer(
         model,
-        algorithm=Algorithm("grpo", clip_eps=args.clip_eps),
+        algorithm=grpo(clip_eps=args.clip_eps, group_size=args.group_size),
         source=RolloutSource(train_agent, env, batch_size=args.group_size, max_episode_steps=9),
         config=TrainerConfig(
             lr=args.lr,
             eps=args.adam_eps,
             micro_batch_size=args.micro_batch_size,
             max_grad_norm=args.max_grad_norm,
-            seed=args.seed,
-            strategy="none",
             mixed_precision="fp16",
-            log_prefix="train",
-            log_every=1,
+            ckpt_dir=args.ckpt_dir,
+            ckpt_every=args.ckpt_every,
         ),
         logger=logger,
         weight_synchronizer=synchronizer,
     )
 
+    if args.resume:
+        trainer.load(args.resume)
+
+    # Eval is rank 0's job: it plays through vLLM, which already holds the
+    # synced policy, and the other ranks just wait at their next collective.
     def log_eval(step: int, e: dict) -> None:
         if logger:
             logger.log({f"eval/{k}_rate": v for k, v in e.items()}, step=step)
 
-    baseline = evaluate(eval_agent, env, args.eval_games)
-    print(fmt_eval("[eval] before training", baseline))
-    log_eval(0, baseline)
+    evals = []
+    if main:
+        baseline = evaluate(eval_agent, env, args.eval_games)
+        print(fmt_eval("[eval] before training", baseline))
+        log_eval(trainer.step, baseline)
+        evals.append((trainer.step, baseline))
 
-    evals = [(0, baseline)]
     for metrics in trainer.train(num_steps=args.iterations):
         step = int(metrics["step"])
+        if not main:
+            continue
         print(
             f"[iter {step:>4}/{args.iterations}] "
             f"return={metrics.get('mean_return', float('nan')):+.2f} "
@@ -169,17 +187,19 @@ def main() -> None:
             print(fmt_eval(f"[eval] after iter {step}", e))
             log_eval(step, e)
 
+    trainer.save(os.path.join(args.ckpt_dir, "final"))
     synchronizer.shutdown()
-    final = evaluate(eval_agent, env, args.eval_games)
-    evals.append((args.iterations, final))
-    log_eval(args.iterations, final)
+    if main:
+        final = evaluate(eval_agent, env, args.eval_games)
+        evals.append((args.iterations, final))
+        log_eval(args.iterations, final)
 
-    print("\n==== win rate vs random opponent ====")
-    for it, e in evals:
-        print(f"  iter {it:>4}: {e['win']:.0%} (illegal {e['illegal']:.0%})")
-    delta = final["win"] - baseline["win"]
-    print(f"\n{fmt_eval('final', final)}")
-    print(f"win rate change: {baseline['win']:.0%} -> {final['win']:.0%} ({delta:+.0%})")
+        print("\n==== win rate vs random opponent ====")
+        for it, e in evals:
+            print(f"  iter {it:>4}: {e['win']:.0%} (illegal {e['illegal']:.0%})")
+        delta = final["win"] - baseline["win"]
+        print(f"\n{fmt_eval('final', final)}")
+        print(f"win rate change: {baseline['win']:.0%} -> {final['win']:.0%} ({delta:+.0%})")
 
     if logger:
         logger.log_summary(
@@ -192,6 +212,7 @@ def main() -> None:
         url = logger.url
         logger.finish()
         print(f"W&B logs: {url}")
+    dist.teardown()
 
 
 if __name__ == "__main__":
