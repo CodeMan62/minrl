@@ -1,10 +1,10 @@
 """Algorithms in minrl"""
+from __future__ import annotations
 
 import torch
 from functools import partial
 from minrl.types import Batch
 from dataclasses import dataclass
-from __future__ import annotations
 from minrl.training import estim, loss
 from typing import Callable, Dict, List, Optional, Tuple
 Estimator = Callable[[Batch], Tuple[List, Dict[str, float]]]

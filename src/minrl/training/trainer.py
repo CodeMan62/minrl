@@ -1,4 +1,5 @@
 """The one update loop."""
+from __future__ import annotations
 
 import os
 from typing import Dict, Iterator, Optional
@@ -6,7 +7,6 @@ import torch
 import torch.optim as optim
 from torch import nn
 from minrl.loggers import Logger
-from __future__ import annotations
 from minrl.training import dist
 from minrl.training.algorithms import Algorithm
 from minrl.training.config import TrainerConfig

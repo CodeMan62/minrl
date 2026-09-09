@@ -1,7 +1,7 @@
-"""Credit assignment for all algorithms
-"""
-import torch
+"""Credit assignment for all algorithms"""
 from __future__ import annotations
+
+import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence as Seq, Tuple
 from minrl.types import Batch, Rollout, Sequence
