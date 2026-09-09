@@ -1,606 +1,119 @@
-import random
-from typing import Dict, Iterator, List, Optional, Tuple
+"""Algorithms in minrl"""
 
 import torch
-
-from minrl.agents.agent import BaseAgent
-from minrl.envs.env import env
-from minrl.interaction import episode
-from minrl.loggers import Logger
-from minrl.types import Rollout
-from minrl.training.utils import batch_data, get_update, register
-from minrl.training.loss import (
-    _cispo_microbatch_loss,
-    _dpo_batch_loss,
-    _grpo_microbatch_loss,
-    _reinforce_microbatch_loss,
-    _sft_batch_loss,
-)
-
-Example = Dict[str, List[int]]
-# One preference pair: {"chosen": Example, "rejected": Example} -- prompt +
-DPOExample = Dict[str, Example]
+from functools import partial
+from minrl.types import Batch
+from dataclasses import dataclass
+from __future__ import annotations
+from minrl.training import estim, loss
+from typing import Callable, Dict, List, Optional, Tuple
+Estimator = Callable[[Batch], Tuple[List, Dict[str, float]]]
+Loss = Callable[..., Tuple[torch.Tensor, Dict[str, float]]]
 
 
+@dataclass(frozen=True)
 class Algorithm:
-    """``Algorithm("grpo", clip_eps=0.2)`` → registered ``@register("grpo")`` update."""
+    """One algorithm have a name a estimator and a loss function(and me ofc)"""
 
-    def __init__(self, name: str, **hparams):
-        self.name = name
-        self.hparams = hparams
-        self._update = get_update(name)
-
-    def update(self, model, optimizer, batch, **kwargs) -> Dict[str, float]:
-        return self._update(
-            model, optimizer, batch_data(batch), **self.hparams, **kwargs
-        )
-
+    name: str
+    estimator: Estimator
+    loss: Loss
 
 # --------------------------------------------------------------------------
-# GRPO
+# policy gradient
 # --------------------------------------------------------------------------
 
 def grpo(
-    model,
-    agent: BaseAgent,
-    env: env,
     *,
-    iterations: int = 200,
-    group_size: int = 8,
-    max_episode_steps: int = 16,
-    lr: float = 5e-6,
     clip_eps: float = 0.2,
-    max_grad_norm: float = 1.0,
-    micro_batch_size: int = 4,
-    log_every: int = 1,
-    logger: Optional[Logger] = None,
-) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
-    """Train ``model`` with GRPO, yielding ``(group, metrics)`` per iteration."""
-    logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    for i in range(iterations):
-        group = []
-        for _ in range(group_size):
-            agent.reset()
-            group.append(episode(agent, env, max_episode_steps))
-        metrics = _grpo_update(
-            model, optimizer, group,
-            clip_eps=clip_eps,
-            max_grad_norm=max_grad_norm,
-            micro_batch_size=micro_batch_size,
-        )
-        logger.log({f"train/{k}": v for k, v in metrics.items()}, step=i + 1)
-        if log_every and (i % log_every == 0 or i == iterations - 1):
-            print(
-                f"[iter {i:>4}] return={metrics['mean_return']:+.3f} "
-                f"loss={metrics['loss']:+.4f} tokens={metrics['n_tokens']:.0f}"
-            )
-        yield group, metrics
+    kl_coef: float = 0.0,
+    group_size: Optional[int] = None,
+) -> Algorithm:
+    """Group Relative Policy Optimization (DeepSeekMath, arXiv:2402.03300)::
 
+        J = E[ 1/G sum_i  1/|o_i| sum_t
+               min(rho * A_i, clip(rho, 1-eps, 1+eps) * A_i) - beta * KL ]
 
-@register("grpo")
-def _grpo_update(
-    model,
-    optimizer: torch.optim.Optimizer,
-    group: List[Rollout],
-    *,
-    clip_eps: float,
-    max_grad_norm: float,
-    micro_batch_size: int,
-    **_kwargs,
-) -> Dict[str, float]:
-    returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
-    mean_r, std_r = returns.mean().item(), returns.std().item()
-    base = {"mean_return": mean_r, "std_return": std_r}
-
-    if std_r < 1e-6:
-        # Every episode got the same return -> all advantages are zero.
-        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
-    advantages = (returns - returns.mean()) / (returns.std() + 1e-6)
-
-    # One training sequence per env step: (token_ids, behaviour logprobs,
-    # action mask, episode advantage).
-    seqs = []
-    for adv, r in zip(advantages.tolist(), group):
-        for s in r.steps:
-            if s.token_ids and s.action_mask and any(s.action_mask):
-                seqs.append((s.token_ids, s.logprobs, s.action_mask, adv))
-    if not seqs:
-        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
-
-    total_action_tokens = sum(sum(mask) for _, _, mask, _ in seqs)
-    total_loss = 0.0
-    model.train()
-    optimizer.zero_grad()
-    for i in range(0, len(seqs), micro_batch_size):
-        loss = _grpo_microbatch_loss(
-            model, seqs[i : i + micro_batch_size], total_action_tokens, clip_eps
-        )
-        loss.backward()
-        total_loss += loss.item()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    optimizer.step()
-
-    return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
-            "skipped": 0.0}
-
-
-# --------------------------------------------------------------------------
-# SFT
-# --------------------------------------------------------------------------
-
-def sft(
-    model,
-    dataset: List[Example],
-    *,
-    epochs: int = 3,
-    micro_batch_size: int = 8,
-    lr: float = 1e-5,
-    max_grad_norm: float = 1.0,
-    log_every: int = 10,
-    shuffle: bool = True,
-    seed: int = 0,
-    logger: Optional[Logger] = None,
-) -> Iterator[Dict[str, float]]:
-    """Imitate a dataset of ``(token_ids, action_mask)`` demonstrations.
-
-    Yields one metrics dict per optimizer step.
+    with ``A_i = (R_i - mean_group R) / std_group R``, and ``rho`` each token's
+    importance ratio against the policy that sampled it.
     """
-    if not dataset:
-        raise ValueError("sft got an empty dataset.")
-    dataset = list(dataset)
-    logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    rng = random.Random(seed)
-
-    step = 0
-    for epoch in range(epochs):
-        order = list(range(len(dataset)))
-        if shuffle:
-            rng.shuffle(order)
-        for i in range(0, len(order), micro_batch_size):
-            batch = [dataset[j] for j in order[i : i + micro_batch_size]]
-            metrics = _sft_update(model, optimizer, batch, max_grad_norm)
-            step += 1
-            metrics["epoch"] = float(epoch)
-            logger.log({f"sft/{k}": v for k, v in metrics.items()}, step=step)
-            if log_every and step % log_every == 0:
-                print(
-                    f"[epoch {epoch} step {step:>5}] "
-                    f"loss={metrics['loss']:.4f} acc={metrics['token_acc']:.3f} "
-                    f"tokens={metrics['n_tokens']:.0f}"
-                )
-            yield metrics
-
-
-@register("sft")
-def _sft_update(
-    model,
-    optimizer: torch.optim.Optimizer,
-    batch: List[Example],
-    max_grad_norm: float,
-    **_kwargs,
-) -> Dict[str, float]:
-    """One optimizer step on a single micro-batch."""
-    model.train()
-    optimizer.zero_grad()
-    loss, acc, n_tok = _sft_batch_loss(model, batch)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    optimizer.step()
-    return {"loss": loss.item(), "token_acc": acc, "n_tokens": float(n_tok)}
-
-
-# --------------------------------------------------------------------------
-# REINFORCE
-# --------------------------------------------------------------------------
-
-def reinforce(
-    model,
-    agent: BaseAgent,
-    env: env,
-    *,
-    iterations: int = 200,
-    batch_size: int = 8,
-    max_episode_steps: int = 16,
-    lr: float = 5e-6,
-    max_grad_norm: float = 1.0,
-    micro_batch_size: int = 4,
-    log_every: int = 1,
-    logger: Optional[Logger] = None,
-) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
-    """Train ``model`` with vanilla REINFORCE (weight = episode return)."""
-    yield from _reinforce_loop(
-        model, agent, env,
-        iterations=iterations,
-        batch_size=batch_size,
-        max_episode_steps=max_episode_steps,
-        lr=lr,
-        max_grad_norm=max_grad_norm,
-        micro_batch_size=micro_batch_size,
-        log_every=log_every,
-        logger=logger,
-        use_baseline=False,
+    return Algorithm(
+        name="grpo",
+        estimator=partial(estim.group_relative, group_size=group_size),
+        loss=partial(
+            loss.clipped_surrogate, agg="seq-mean",
+            clip_eps=clip_eps, kl_coef=kl_coef,
+        ),
     )
 
-
-def reinforce_baseline(
-    model,
-    agent: BaseAgent,
-    env: env,
-    *,
-    iterations: int = 200,
-    batch_size: int = 8,
-    max_episode_steps: int = 16,
-    lr: float = 5e-6,
-    max_grad_norm: float = 1.0,
-    micro_batch_size: int = 4,
-    log_every: int = 1,
-    logger: Optional[Logger] = None,
-) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
-    """REINFORCE with a batch-mean return baseline: weight = ``R - mean(R)``."""
-    yield from _reinforce_loop(
-        model, agent, env,
-        iterations=iterations,
-        batch_size=batch_size,
-        max_episode_steps=max_episode_steps,
-        lr=lr,
-        max_grad_norm=max_grad_norm,
-        micro_batch_size=micro_batch_size,
-        log_every=log_every,
-        logger=logger,
-        use_baseline=True,
-    )
-
-
-def _reinforce_loop(
-    model,
-    agent: BaseAgent,
-    env: env,
-    *,
-    iterations: int,
-    batch_size: int,
-    max_episode_steps: int,
-    lr: float,
-    max_grad_norm: float,
-    micro_batch_size: int,
-    log_every: int,
-    logger: Optional[Logger],
-    use_baseline: bool,
-) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
-    logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    for i in range(iterations):
-        batch = []
-        for _ in range(batch_size):
-            agent.reset()
-            batch.append(episode(agent, env, max_episode_steps))
-        metrics = _reinforce_update(
-            model, optimizer, batch,
-            use_baseline=use_baseline,
-            max_grad_norm=max_grad_norm,
-            micro_batch_size=micro_batch_size,
-        )
-        logger.log({f"train/{k}": v for k, v in metrics.items()}, step=i + 1)
-        if log_every and (i % log_every == 0 or i == iterations - 1):
-            print(
-                f"[iter {i:>4}] return={metrics['mean_return']:+.3f} "
-                f"loss={metrics['loss']:+.4f} tokens={metrics['n_tokens']:.0f}"
-            )
-        yield batch, metrics
-
-
-@register("reinforce")
-def _reinforce_update(
-    model,
-    optimizer: torch.optim.Optimizer,
-    batch: List[Rollout],
-    *,
-    use_baseline: bool,
-    max_grad_norm: float,
-    micro_batch_size: int,
-    **_kwargs,
-) -> Dict[str, float]:
-    returns = torch.tensor([r.total_reward for r in batch], dtype=torch.float32)
-    mean_r, std_r = returns.mean().item(), returns.std().item()
-    base = {"mean_return": mean_r, "std_return": std_r}
-
-    if use_baseline:
-        if std_r < 1e-6:
-            # Constant return across the batch -> zero advantages.
-            return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
-        weights = returns - returns.mean()
-    else:
-        weights = returns
-
-    # One training sequence per env step: (token_ids, action_mask, weight).
-    seqs = []
-    for w, r in zip(weights.tolist(), batch):
-        for s in r.steps:
-            if s.token_ids and s.action_mask and any(s.action_mask):
-                seqs.append((s.token_ids, s.action_mask, w))
-    if not seqs:
-        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
-
-    total_action_tokens = sum(sum(mask) for _, mask, _ in seqs)
-    total_loss = 0.0
-    model.train()
-    optimizer.zero_grad()
-    for i in range(0, len(seqs), micro_batch_size):
-        loss = _reinforce_microbatch_loss(
-            model, seqs[i : i + micro_batch_size], total_action_tokens
-        )
-        loss.backward()
-        total_loss += loss.item()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    optimizer.step()
-
-    return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
-            "skipped": 0.0}
-
-
-# --------------------------------------------------------------------------
-# DPO
-# --------------------------------------------------------------------------
-
-def dpo(
-    model,
-    ref_model,
-    dataset: List[DPOExample],
-    *,
-    epochs: int = 1,
-    micro_batch_size: int = 4,
-    lr: float = 1e-6,
-    beta: float = 0.1,
-    max_grad_norm: float = 1.0,
-    log_every: int = 10,
-    shuffle: bool = True,
-    seed: int = 0,
-    logger: Optional[Logger] = None,
-) -> Iterator[Dict[str, float]]:
-    """Direct Preference Optimization over a dataset of preference pairs.
-
-    Each example is ``{"chosen": {"token_ids": [...], "action_mask": [...]},
-    "rejected": {...}}`` -- the same shape as an SFT example, once per side.
-    ``ref_model`` should be a frozen copy of the policy DPO starts from (e.g.
-    the SFT checkpoint); it is only ever read under ``torch.no_grad()`` and is
-    never updated. Yields one metrics dict per optimizer step.
-    """
-    if not dataset:
-        raise ValueError("dpo got an empty dataset.")
-    dataset = list(dataset)
-    logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    rng = random.Random(seed)
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad_(False)
-
-    step = 0
-    for epoch in range(epochs):
-        order = list(range(len(dataset)))
-        if shuffle:
-            rng.shuffle(order)
-        for i in range(0, len(order), micro_batch_size):
-            batch = [dataset[j] for j in order[i : i + micro_batch_size]]
-            metrics = _dpo_update(
-                model, optimizer, batch,
-                ref_model=ref_model, beta=beta, max_grad_norm=max_grad_norm,
-            )
-            step += 1
-            metrics["epoch"] = float(epoch)
-            logger.log({f"dpo/{k}": v for k, v in metrics.items()}, step=step)
-            if log_every and step % log_every == 0:
-                print(
-                    f"[epoch {epoch} step {step:>5}] "
-                    f"loss={metrics['loss']:.4f} acc={metrics['accuracy']:.3f} "
-                    f"margin={metrics['margin']:+.3f}"
-                )
-            yield metrics
-
-
-@register("dpo")
-def _dpo_update(
-    model,
-    optimizer: torch.optim.Optimizer,
-    batch: List[DPOExample],
-    *,
-    ref_model,
-    beta: float,
-    max_grad_norm: float,
-    **_kwargs,
-) -> Dict[str, float]:
-    """One optimizer step on a single micro-batch."""
-    model.train()
-    ref_model.eval()
-    optimizer.zero_grad()
-    loss, accuracy, margin = _dpo_batch_loss(model, ref_model, batch, beta)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    optimizer.step()
-    return {"loss": loss.item(), "accuracy": accuracy, "margin": margin}
-
-# --------------------------------------------------------------------------
-# Dr. GRPO
-# --------------------------------------------------------------------------
 
 def dr_grpo(
-    model,
-    agent: BaseAgent,
-    env: env,
     *,
-    iterations: int = 200,
-    group_size: int = 8,
-    max_episode_steps: int = 16,
-    max_tokens: int = 512,
-    lr: float = 5e-6,
+    max_tokens: int,
     clip_eps: float = 0.2,
-    max_grad_norm: float = 1.0,
-    micro_batch_size: int = 4,
-    log_every: int = 1,
-    logger: Optional[Logger] = None,
-) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
-    logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    norm_constant = group_size * max_tokens
-    for i in range(iterations):
-        group = []
-        for _ in range(group_size):
-            agent.reset()
-            group.append(episode(agent, env, max_episode_steps))
-        metrics = _dr_grpo_update(
-            model, optimizer, group,
-            clip_eps=clip_eps,
-            max_grad_norm=max_grad_norm,
-            micro_batch_size=micro_batch_size,
-            norm_constant=norm_constant,
-        )
-        logger.log({f"train/{k}": v for k, v in metrics.items()}, step=i + 1)
-        if log_every and (i % log_every == 0 or i == iterations - 1):
-            print(
-                f"[iter {i:>4}] return={metrics['mean_return']:+.3f} "
-                f"loss={metrics['loss']:+.4f} tokens={metrics['n_tokens']:.0f}"
-            )
-        yield group, metrics
+    kl_coef: float = 0.0,
+    group_size: Optional[int] = None,
+) -> Algorithm:
+    """Dr. GRPO (arXiv:2503.20783).
+    """
+    return Algorithm(
+        name="dr_grpo",
+        estimator=partial(estim.group_relative, group_size=group_size, std=False),
+        loss=partial(
+            loss.clipped_surrogate, agg="budget", max_tokens=max_tokens,
+            clip_eps=clip_eps, kl_coef=kl_coef,
+        ),
+    )
 
-
-@register("dr_grpo")
-def _dr_grpo_update(
-    model,
-    optimizer: torch.optim.Optimizer,
-    group: List[Rollout],
-    *,
-    clip_eps: float,
-    max_grad_norm: float,
-    micro_batch_size: int,
-    norm_constant: int,
-    **_kwargs,
-) -> Dict[str, float]:
-    returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
-    mean_r, std_r = returns.mean().item(), returns.std().item()
-    base = {"mean_return": mean_r, "std_return": std_r}
-
-    if std_r < 1e-6:
-        # Every episode got the same return -> all advantages are zero.
-        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
-    # Unlike GRPO, no division by std_r: keeps low-variance groups from
-    # dominating the update.
-    advantages = returns - returns.mean()
-
-    # One training sequence per env step: (token_ids, behaviour logprobs,
-    # action mask, episode advantage).
-    seqs = []
-    for adv, r in zip(advantages.tolist(), group):
-        for s in r.steps:
-            if s.token_ids and s.action_mask and any(s.action_mask):
-                seqs.append((s.token_ids, s.logprobs, s.action_mask, adv))
-    if not seqs:
-        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
-
-    total_action_tokens = sum(sum(mask) for _, _, mask, _ in seqs)
-    total_loss = 0.0
-    model.train()
-    optimizer.zero_grad()
-    for i in range(0, len(seqs), micro_batch_size):
-        # Fixed constant normalizer (not total_action_tokens): removes the
-        # response-length bias GRPO's per-batch token count introduces.
-        loss = _grpo_microbatch_loss(
-            model, seqs[i : i + micro_batch_size], norm_constant, clip_eps
-        )
-        loss.backward()
-        total_loss += loss.item()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    optimizer.step()
-    return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
-            "skipped": 0.0}
-
-
-# --------------------------------------------------------------------------
-# CISPO
-# --------------------------------------------------------------------------
 
 def cispo(
-    model,
-    agent: BaseAgent,
-    env: env,
     *,
-    iterations: int = 200,
-    group_size: int = 8,
-    max_episode_steps: int = 16,
-    lr: float = 5e-6,
     eps_low: float = 0.2,
     eps_high: float = 4.0,
-    max_grad_norm: float = 1.0,
-    micro_batch_size: int = 4,
-    log_every: int = 1,
-    logger: Optional[Logger] = None,
-) -> Iterator[Tuple[List[Rollout], Dict[str, float]]]:
-    logger = logger or Logger()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    for i in range(iterations):
-        group = []
-        for _ in range(group_size):
-            agent.reset()
-            group.append(episode(agent, env, max_episode_steps))
-        metrics = _cispo_update(
-            model, optimizer, group,
-            eps_low=eps_low,
-            eps_high=eps_high,
-            max_grad_norm=max_grad_norm,
-            micro_batch_size=micro_batch_size,
-        )
-        logger.log({f"train/{k}": v for k, v in metrics.items()}, step=i + 1)
-        if log_every and (i % log_every == 0 or i == iterations - 1):
-            print(
-                f"[iter {i:>4}] return={metrics['mean_return']:+.3f} "
-                f"loss={metrics['loss']:+.4f} tokens={metrics['n_tokens']:.0f}"
-            )
-        yield group, metrics
+    group_size: Optional[int] = None,
+) -> Algorithm:
+    """Clipped IS-weight Policy Optimization (MiniMax-M1, arXiv:2506.13585)::
+        J = E[ 1/sum_i|o_i| sum_i sum_t
+               sg(clip(rho, 1-eps_low, 1+eps_high)) * A_i * log pi(o_it) ]
+    """
+    return Algorithm(
+        name="cispo",
+        estimator=partial(estim.group_relative, group_size=group_size),
+        loss=partial(
+            loss.cispo_surrogate, agg="token-mean",
+            eps_low=eps_low, eps_high=eps_high,
+        ),
+    )
 
 
-@register("cispo")
-def _cispo_update(
-    model,
-    optimizer: torch.optim.Optimizer,
-    group: List[Rollout],
-    *,
-    eps_low: float,
-    eps_high: float,
-    max_grad_norm: float,
-    micro_batch_size: int,
-    **_kwargs,
-) -> Dict[str, float]:
-    returns = torch.tensor([r.total_reward for r in group], dtype=torch.float32)
-    mean_r, std_r = returns.mean().item(), returns.std().item()
-    base = {"mean_return": mean_r, "std_return": std_r}
+def reinforce(*, gamma: float = 1.0, baseline: bool = True) -> Algorithm:
+    """Vanilla policy gradient with a Monte-Carlo return estimate::
+        grad J = 1/N sum_i sum_t (G_t - b) grad log pi(a_t | s_t)
+    """
+    return Algorithm(
+        name="reinforce",
+        estimator=partial(estim.monte_carlo, gamma=gamma, baseline=baseline),
+        loss=partial(loss.score_function, agg="seq-sum"),
+    )
 
-    if std_r < 1e-6:
-        # Every episode got the same return -> all advantages are zero.
-        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
-    advantages = (returns - returns.mean()) / (returns.std() + 1e-6)
 
-    # One training sequence per env step: (token_ids, behaviour logprobs,
-    # action mask, episode advantage).
-    seqs = []
-    for adv, r in zip(advantages.tolist(), group):
-        for s in r.steps:
-            if s.token_ids and s.action_mask and any(s.action_mask):
-                seqs.append((s.token_ids, s.logprobs, s.action_mask, adv))
-    if not seqs:
-        return {**base, "loss": 0.0, "n_tokens": 0.0, "skipped": 1.0}
+# --------------------------------------------------------------------------
+# offline
+# --------------------------------------------------------------------------
 
-    total_action_tokens = sum(sum(mask) for _, _, mask, _ in seqs)
-    total_loss = 0.0
-    model.train()
-    optimizer.zero_grad()
-    for i in range(0, len(seqs), micro_batch_size):
-        loss = _cispo_microbatch_loss(
-            model, seqs[i : i + micro_batch_size], total_action_tokens,
-            eps_low, eps_high,
-        )
-        loss.backward()
-        total_loss += loss.item()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    optimizer.step()
-    return {**base, "loss": total_loss, "n_tokens": float(total_action_tokens),
-            "skipped": 0.0}
+def sft() -> Algorithm:
+    """ sft """
+    return Algorithm(
+        name="sft",
+        estimator=estim.demonstrations,
+        loss=partial(loss.cross_entropy, agg="token-mean"),
+    )
+
+
+def dpo(*, beta: float = 0.1) -> Algorithm:
+    """Direct Preference Optimization (arXiv:2305.18290)."""
+    return Algorithm(
+        name="dpo",
+        estimator=estim.preferences,
+        loss=partial(loss.preference, beta=beta),
+    )

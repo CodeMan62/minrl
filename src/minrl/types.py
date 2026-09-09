@@ -62,3 +62,10 @@ class Batch:
 class BatchSource:
     def next_batch(self) -> Batch:
         raise NotImplementedError
+#Training types
+@dataclass
+class Sequence:
+    token_ids: List[int]
+    action_mask: List[int]
+    logprobs: Optional[List[float]] = None
+    advantages: float = 1.0
