@@ -91,6 +91,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         FlexibleArgumentParser(description="minrl vLLM server")
     ).parse_args()
     validate_parsed_serve_args(args)
+    if getattr(args, "model_tag", None) is not None:
+        args.model = args.model_tag
     args.return_tokens_as_token_ids = True
     args.worker_extension_cls = "minrl.inference.weight_sync.WeightSyncWorkerExtension"
 
