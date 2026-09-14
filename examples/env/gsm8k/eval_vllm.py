@@ -15,7 +15,8 @@ _ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..")
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 
-from enviornments.gsm8k import GSM8K, GSM8K_SYSTEM_PROMPT, evaluate_gsm8k  # noqa: E402
+from enviornments.gsm8k import GSM8K, GSM8K_SYSTEM_PROMPT  # noqa: E402
+from examples.env.gsm8k.train_grpo import evaluate_gsm8k  # noqa: E402
 from minrl.agents.llm_agent import LLMAgent  # noqa: E402
 from minrl.inference.chat_template import HFChatTemplate  # noqa: E402
 from minrl.inference.parser import TextParser  # noqa: E402
@@ -30,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--samples", type=int, default=200)
     p.add_argument("--split", default="test", choices=["train", "test"])
     p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
     return p.parse_args()
 
 
