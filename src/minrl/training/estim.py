@@ -120,7 +120,7 @@ def _assign(rollouts: Seq[Rollout], weights: Seq[Seq[float]]) -> Assignment:
         "mean_return": returns.mean().item(),
         "std_return": returns.std().item() if returns.numel() > 1 else 0.0,
         "n_tokens": float(sum(sum(s.action_mask) for s in seqs)),
-        "n_live": float(sum(1 for s in seqs if s.advantage)),
+        "n_live": float(sum(1 for s in seqs if s.advantages)),
     }
 
 

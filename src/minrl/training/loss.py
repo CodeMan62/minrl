@@ -35,7 +35,7 @@ def pack(seqs: Seq[Sequence], device: torch.device) -> Packed:
     return Packed(
         ids=ids, attn=attn, targets=ids[:, 1:], mask=mask[:, 1:], old_logp=old[:, 1:],
         adv=torch.tensor(
-            [s.advantage for s in seqs], dtype=torch.float32, device=device
+            [s.advantages for s in seqs], dtype=torch.float32, device=device
         ),
     )
 
