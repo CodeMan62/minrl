@@ -111,7 +111,7 @@ def _assign(rollouts: Seq[Rollout], weights: Seq[Seq[float]]) -> Assignment:
                     token_ids=list(step.token_ids),
                     action_mask=list(step.action_mask),
                     logprobs=list(step.logprobs) if step.logprobs else None,
-                    advantage=w,
+                    advantages=w,
                 )
             )
 
