@@ -1,11 +1,12 @@
 from dataclasses import dataclass, field
-from typing import Dict, Union, Any, List, Optional
+from typing import Dict, Union, Any, List, Optional, Tuple
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
 
 Observation = str
 Info = Dict[str, JSON]
+Span = Tuple[int, int]  # [start, end) of a step's tokens in the rollout's sequence
 # Agent level types
 @dataclass
 class Step:
@@ -17,9 +18,12 @@ class Step:
     terminated: bool
     truncated: bool
     info: Info
+    # per-step mode: this step's own sequence
     token_ids: Optional[List[int]] = None
     logprobs: Optional[List[float]] = None
     action_mask: Optional[List[int]] = None
+    # multi-turn mode: this step's slice of the rollout's sequence
+    span: Optional[Span] = None
 @dataclass
 class Rollout:
     index: int
@@ -28,6 +32,10 @@ class Rollout:
     terminated: bool
     truncated: bool
     info: Info
+    # multi-turn mode: the whole episode as one sequence
+    token_ids: Optional[List[int]] = None
+    logprobs: Optional[List[float]] = None
+    action_mask: Optional[List[int]] = None
 # Env level types
 @dataclass
 class StepOutPut:
@@ -68,4 +76,4 @@ class Sequence:
     token_ids: List[int]
     action_mask: List[int]
     logprobs: Optional[List[float]] = None
-    advantages: float = 1.0
+    advantages: Union[float, List[float]] = 1.0  # one per sequence, or one per token

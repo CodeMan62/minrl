@@ -34,23 +34,40 @@ class HFChatTemplate:
             prompt_text=prompt_text
         )
 
-    def tool_turn_ids(self, responses: List[str]) -> List[int]:
-        """Token ids that close the assistant turn, add one ``tool`` message per
-        response, and reopen the assistant turn -- appended verbatim after the
-        sampled ids, so the model's own tokens are never re-tokenized.
+    def user_turn_ids(self, content: str) -> List[int]:
+        """Ids that close the assistant turn, add a user message, reopen the assistant turn."""
+        return self._turn_suffix([{"role": "user", "content": content}])
 
-        The sampler drops the eos it stopped on, so the segment starts with it.
-        Everything after it is read off the model's own template by diffing two
-        renders that share a dummy prefix.
+    def tool_turn_ids(self, responses: List[str]) -> List[int]:
+        """Same as ``user_turn_ids``, with one tool message per response."""
+        return self._turn_suffix([{"role": "tool", "content": r} for r in responses])
+
+    def _turn_suffix(self, messages: List[Message]) -> List[int]:
+        """Ids to append after sampled tokens, starting with the eos the sampler dropped.
+
+        Read off the template by diffing two renders that differ only in the new
+        message's content. Both include a follower, since Qwen3 renders an
+        assistant turn differently once something follows it.
         """
         eos = self.tokenizer.eos_token_id
         base = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]
-        tools = [{"role": "tool", "content": r} for r in responses]
-        prefix = self.apply(base, add_generation_prompt=False).prompt_ids
-        full = self.apply(base + tools, add_generation_prompt=True).prompt_ids
-        if full[: len(prefix)] != prefix or eos not in prefix:
-            raise ValueError("chat template does not render tool turns as a token suffix")
-        # prefix ends `...<eos>` plus whatever the template puts after it (`\n` on Qwen)
-        cut = len(prefix) - 1 - prefix[::-1].index(eos)
-        return list(prefix[cut:]) + list(full[len(prefix):])
+        role = messages[0]["role"]
+        probes = [
+            self.apply(base + [{"role": role, "content": c}], add_generation_prompt=True).prompt_ids
+            for c in ("0", "1")
+        ]
+        head = _common_prefix(*probes)  # ends inside the new turn's header
+        full = self.apply(base + messages, add_generation_prompt=True).prompt_ids
+        if full[: len(head)] != head or eos not in head:
+            raise ValueError("chat template does not render this turn as a token suffix")
+        cut = len(head) - 1 - head[::-1].index(eos)  # eos closing the assistant turn
+        return list(full[cut:])
 
+
+def _common_prefix(a: List[int], b: List[int]) -> List[int]:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return list(a[:n])

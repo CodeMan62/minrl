@@ -21,7 +21,7 @@ class Packed:
     targets: torch.Tensor   # [B, T-1]  ids shifted left
     mask: torch.Tensor      # [B, T-1]  1.0 on generated tokens
     old_logp: torch.Tensor  # [B, T-1]  behaviour-policy logprobs
-    adv: torch.Tensor       # [B]
+    adv: torch.Tensor       # [B, T-1]  weight of each target token
 
 
 def pack(seqs: Seq[Sequence], device: torch.device) -> Packed:
@@ -32,11 +32,18 @@ def pack(seqs: Seq[Sequence], device: torch.device) -> Packed:
     # ``logprobs=None`` (offline data) pads up from empty; those positions are masked.
     old = _pad([s.logprobs or [] for s in seqs], max_len, 0.0, torch.float32, device)
     attn = _pad([[1] * len(s.token_ids) for s in seqs], max_len, 0, torch.long, device)
+    # Scalar advantage broadcast over the sequence, or one per token; shifted like the mask.
+    adv = _pad(
+        [
+            s.advantages if isinstance(s.advantages, list)
+            else [s.advantages] * len(s.token_ids)
+            for s in seqs
+        ],
+        max_len, 0.0, torch.float32, device,
+    )
     return Packed(
         ids=ids, attn=attn, targets=ids[:, 1:], mask=mask[:, 1:], old_logp=old[:, 1:],
-        adv=torch.tensor(
-            [s.advantages for s in seqs], dtype=torch.float32, device=device
-        ),
+        adv=adv[:, 1:],
     )
 
 
@@ -112,7 +119,7 @@ def clipped_surrogate(
     """
     p, logp = logprobs(model, seqs)
     ratio = torch.exp(logp - p.old_logp)
-    a = p.adv[:, None]
+    a = p.adv
     surrogate = torch.minimum(ratio * a, ratio.clamp(1 - clip_eps, 1 + clip_eps) * a)
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, clip_eps, clip_eps)}
@@ -152,7 +159,7 @@ def cispo_surrogate(
     """
     p, logp = logprobs(model, seqs)
     ratio = torch.exp(logp - p.old_logp)
-    surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv[:, None] * logp
+    surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv * logp
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, eps_low, eps_high)}
     return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
@@ -165,7 +172,7 @@ def score_function(
         L = -E_t[ A_t * log pi_theta(a_t | s_t) ]
     """
     p, logp = logprobs(model, seqs)
-    return -reduce(p.adv[:, None] * logp, p.mask, agg=agg, n_seqs=n_seqs,
+    return -reduce(p.adv * logp, p.mask, agg=agg, n_seqs=n_seqs,
                    n_tokens=n_tokens), {}
 
 

@@ -95,14 +95,32 @@ def _relative(returns: torch.Tensor, std: bool) -> torch.Tensor:
 
 
 def _assign(rollouts: Seq[Rollout], weights: Seq[Seq[float]]) -> Assignment:
-    """Flatten rollouts into one sequence per generated turn, carrying its weight.
+    """Rollouts -> weighted sequences.
 
-    Turns the agent generated nothing for are dropped.  Zero-weight sequences
-    are kept -- they still count toward the loss normalizer -- and ``n_live``
-    reports how many carry signal, so the Trainer can skip a step where none do.
+    Per-step: one sequence per step, weighted by that step. Multi-turn: one
+    sequence per episode, each step's weight over its span. Steps with no
+    generated tokens are dropped. Zero-weight sequences stay (they count in
+    the normalizer); ``n_live`` says how many carry signal.
     """
     seqs: List[Sequence] = []
     for rollout, ws in zip(rollouts, weights):
+        if rollout.token_ids is not None:
+            if not any(rollout.action_mask or ()):
+                continue
+            per_token = [0.0] * len(rollout.token_ids)
+            for step, w in zip(rollout.steps, ws):
+                if step.span:
+                    lo, hi = step.span
+                    per_token[lo:hi] = [w] * (hi - lo)
+            seqs.append(
+                Sequence(
+                    token_ids=list(rollout.token_ids),
+                    action_mask=list(rollout.action_mask),
+                    logprobs=list(rollout.logprobs) if rollout.logprobs else None,
+                    advantages=per_token,
+                )
+            )
+            continue
         for step, w in zip(rollout.steps, ws):
             if not step.token_ids or not any(step.action_mask or ()):
                 continue
@@ -120,8 +138,15 @@ def _assign(rollouts: Seq[Rollout], weights: Seq[Seq[float]]) -> Assignment:
         "mean_return": returns.mean().item(),
         "std_return": returns.std().item() if returns.numel() > 1 else 0.0,
         "n_tokens": float(sum(sum(s.action_mask) for s in seqs)),
-        "n_live": float(sum(1 for s in seqs if s.advantages)),
+        "n_live": float(sum(1 for s in seqs if _live(s))),
     }
+
+def _live(seq: Sequence) -> bool:
+    """True if any action token has a non-zero weight."""
+    a = seq.advantages
+    if isinstance(a, list):
+        return any(w and m for w, m in zip(a, seq.action_mask))
+    return bool(a) and any(seq.action_mask)
 
 
 def _from_example(example: Dict[str, List[int]]) -> Sequence:

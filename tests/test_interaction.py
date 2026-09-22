@@ -17,7 +17,7 @@ from minrl.types import Info, Observation, Rollout, StepOutPut
 
 
 class CountingEnv(SingleAgentEnv):
-    """Deterministic env: reward 1.0 per step, terminates every `episode_len`."""
+    """Deterministic env: reward 1.0 per step, terminates after `episode_len`."""
 
     def __init__(self, episode_len: int = 3):
         self.episode_len = episode_len
@@ -70,17 +70,23 @@ def test_run_returns_single_rollout_list():
 
 
 def test_rollout_step_count_and_reward():
+    # one episode: the env ends it after 3 steps even though 6 are allowed
     r = SingleAgentProtocol(CountingEnv(3), ConstantAgent(), num_steps=6).run()[0]
-    assert len(r.steps) == 6
-    assert r.total_reward == 6.0  # 1.0 reward per step
+    assert len(r.steps) == 3
+    assert r.total_reward == 3.0  # 1.0 reward per step
 
 
-def test_termination_and_autoreset_boundaries():
-    # episode_len=3 => steps at index 2 and 5 are terminal, others are not.
+def test_termination_ends_the_episode():
     r = SingleAgentProtocol(CountingEnv(3), ConstantAgent(), num_steps=6).run()[0]
-    assert [s.terminated for s in r.steps] == [False, False, True, False, False, True]
-    # after a terminal step the env resets, so the next obs restarts at t=1.
-    assert r.steps[3].next_obs == "t=1"
+    assert [s.terminated for s in r.steps] == [False, False, True]
+    assert r.terminated and not r.truncated
+    assert r.steps[-1].next_obs == "t=3"
+
+
+def test_max_steps_caps_the_episode():
+    r = SingleAgentProtocol(CountingEnv(10), ConstantAgent(), num_steps=4).run()[0]
+    assert len(r.steps) == 4
+    assert not r.terminated and not r.truncated
 
 
 def test_token_trace_defaults_none_for_non_llm_agent():
@@ -100,5 +106,5 @@ def test_token_trace_captured_from_agent():
 def test_free_episode_function_matches_protocol():
     # SingleAgentProtocol.run() should wrap the same episode() body.
     r = episode(ConstantAgent(), CountingEnv(3), 4)
-    assert len(r.steps) == 4
-    assert r.index == 4
+    assert len(r.steps) == 3
+    assert r.index == 3

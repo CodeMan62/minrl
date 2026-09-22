@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any, List, Sequence
+from typing import Any, List, Optional, Sequence
 
 from minrl.agents.agent import BaseAgent
 from minrl.envs.env import env as Env
@@ -24,19 +24,32 @@ class RolloutSource(BatchSource):
         *,
         batch_size: int = 8,
         max_episode_steps: int = 16,
+        group_size: Optional[int] = None,
+        group_seed: bool = False, # True resets each groupp of group_size
+        seed: int = 0,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if group_seed and (not group_size or batch_size % group_size):
+            raise ValueError("group_seed needs a group_size that divides batch_size")
         self.agent = agent
         self.env = env
         self.batch_size = batch_size
         self.max_episode_steps = max_episode_steps
+        self.group_size = group_size
+        self.group_seed = group_seed
+        self.rng = random.Random(seed)
 
     def next_batch(self) -> Batch:
         rollouts: List[Rollout] = []
-        for _ in range(self.batch_size):
+        seed: Optional[int] = None
+        for i in range(self.batch_size):
+            if self.group_seed and i % self.group_size == 0:
+                seed = self.rng.randrange(2**31)
             self.agent.reset()
-            rollouts.append(episode(self.agent, self.env, self.max_episode_steps))
+            rollouts.append(
+                episode(self.agent, self.env, self.max_episode_steps, seed=seed)
+            )
         return Batch(rollouts=rollouts)
 
 

@@ -60,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--adam-eps", type=float, default=1e-4)
     p.add_argument("--max-new-tokens", type=int, default=8)
+    p.add_argument("--multi-turn", action="store_true",
+                   help="one sequence per game: the policy sees every earlier board "
+                        "and its own moves, instead of a fresh prompt per move")
+    p.add_argument("--max-seq-len", type=int, default=2048,
+                   help="context budget per game in --multi-turn mode")
     p.add_argument("--micro-batch-size", type=int, default=4)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--clip-eps", type=float, default=0.2)
@@ -124,14 +129,12 @@ def main() -> None:
 
     # Training samples at T=1.0 so behaviour logprobs match the raw policy;
     # eval decodes greedily (T=0) against the same random opponent.
-    train_agent = LLMAgent(
-        client, template, parser, system_prompt=SYSTEM_PROMPT,
-        max_tokens=args.max_new_tokens, temperature=1.0,
+    agent_kw = dict(
+        system_prompt=SYSTEM_PROMPT, max_tokens=args.max_new_tokens,
+        multi_turn=args.multi_turn, max_seq_len=args.max_seq_len if args.multi_turn else None,
     )
-    eval_agent = LLMAgent(
-        client, template, parser, system_prompt=SYSTEM_PROMPT,
-        max_tokens=args.max_new_tokens, temperature=0.0,
-    )
+    train_agent = LLMAgent(client, template, parser, temperature=1.0, **agent_kw)
+    eval_agent = LLMAgent(client, template, parser, temperature=0.0, **agent_kw)
 
     synchronizer = vllm_weight_synchronizer(
         model, args.vllm_url, host=args.weight_transfer_host, port=args.weight_transfer_port,
