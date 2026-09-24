@@ -145,6 +145,12 @@ class Trainer:
                 )
             yield stats
 
+    def close(self) -> None:
+        """Release the batch source; a RolloutSource stops generating and joins its loop."""
+        close = getattr(self.source, "close", None)
+        if close is not None:
+            close()
+
     # ---- checkpointing --------------------------------------------------
 
     def save(self, path: str) -> None:
