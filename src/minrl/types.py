@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, Union, Any, List, Optional, Tuple
+from minrl.agents.agent import BaseAgent
+from minrl.envs.env import env
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
@@ -77,3 +79,15 @@ class Sequence:
     action_mask: List[int]
     logprobs: Optional[List[float]] = None
     advantages: Union[float, List[float]] = 1.0  # one per sequence, or one per token
+
+@dataclass(frozen=True)
+class RolloutRequest:
+    agent: BaseAgent
+    env: env
+    seed: Optional[int] = None
+
+@dataclass(frozen=True)
+class Group:
+    request_id: str
+    rollouts: List[Rollout]
+    staleness: int

@@ -6,7 +6,7 @@ import random
 import threading
 from typing import Any, Callable, List, Optional, Sequence
 
-from minrl.rollout_engine import Actor, RolloutEngine
+from minrl.rollout_engine import Actor, Group, RolloutEngine
 from minrl.types import Batch, BatchSource
 
 
@@ -46,8 +46,11 @@ class RolloutSource(BatchSource):
     def _call(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
+    async def _groups(self, n: int) -> List[Group]:
+        return [await self.engine.generate() for _ in range(n)]
+
     def next_batch(self) -> Batch:
-        groups = self._call(self.engine.generate_batch(self.groups_per_batch))
+        groups = self._call(self._groups(self.groups_per_batch))
         staleness = [g.staleness for g in groups]
         return Batch(
             rollouts=[r for g in groups for r in g.rollouts],
@@ -57,9 +60,12 @@ class RolloutSource(BatchSource):
             },
         )
 
+    async def _cancel(self, request_id: str) -> bool:
+        return self.engine.cancel(request_id)
+
     def cancel(self, request_id: str) -> bool:
-        """Cancel one in-flight rollout request by id (see :meth:`RolloutEngine.cancel`)."""
-        return self._call(self.engine.cancel(request_id))
+        """Cancel one in-flight request by id; the hop lands Task.cancel() on the engine's loop."""
+        return self._call(self._cancel(request_id))
 
     def close(self) -> None:
         """Cancel every in-flight request and stop the background loop."""
@@ -67,6 +73,12 @@ class RolloutSource(BatchSource):
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join()
         self._loop.close()
+
+    def __enter__(self) -> "RolloutSource":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
 
 
 class DatasetSource(BatchSource):
