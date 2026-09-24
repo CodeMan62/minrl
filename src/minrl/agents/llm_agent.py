@@ -80,9 +80,9 @@ class LLMAgent(BaseAgent):
             return self.max_tokens
         return min(self.max_tokens, self.max_seq_len - len(ids))
 
-    def _generate(self, ids: List[int], max_tokens: int):
+    async def _generate(self, ids: List[int], max_tokens: int):
         eos_token_id = self.template.tokenizer.eos_token_id
-        return self.client.complete_tokens(
+        return await self.client.complete_tokens(
             ids,
             max_tokens=max_tokens,
             temperature=self.temperature,
@@ -120,7 +120,7 @@ class LLMAgent(BaseAgent):
             )
         return ids, [0.0] * len(ids), [0] * len(ids), len(ids)
 
-    def act(self, obs: str) -> Optional[int]:
+    async def act(self, obs: str) -> Optional[int]:
         ids, logprobs, mask, start = self._start_turn(obs)
         turns: List[Message] = []
         self.last_tool_calls = 0
@@ -130,7 +130,7 @@ class LLMAgent(BaseAgent):
             budget = self._budget(ids)
             if budget <= 0:
                 break  # observation filled the context; nothing sampled
-            resp = self._generate(ids, budget)
+            resp = await self._generate(ids, budget)
             ids += list(resp.token_idx)
             logprobs += list(resp.logprobs)
             mask += [1] * len(resp.token_idx)

@@ -1,6 +1,6 @@
 from typing import List, Optional, Tuple
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from minrl.inference.client import InferenceClient
 from minrl.types import ChatResponse
@@ -32,9 +32,9 @@ class VLLMClient(InferenceClient):
     def __init__(self, base_url: str, model: str, api_key: str = "local"):
         self.base_url = base_url
         self.model = model
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    def complete_tokens(
+    async def complete_tokens(
         self,
         prompt_token_ids: List[int],
         *,
@@ -45,7 +45,7 @@ class VLLMClient(InferenceClient):
     ) -> ChatResponse:
         # Passing a list[int] as ``prompt`` makes vLLM treat it as token ids.
         extra_body = {"stop_token_ids": stop_token_ids} if stop_token_ids else None
-        resp = self.client.completions.create(
+        resp = await self.client.completions.create(
             model=self.model,
             prompt=prompt_token_ids,
             max_tokens=max_tokens,

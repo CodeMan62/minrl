@@ -1,4 +1,7 @@
-"""minrl vLLM server: OpenAI-compatible API with weight synchronization.
+"""minrl vLLM server: vLLM's OpenAI-compatible app, plus our own routes.
+
+We build the app ourselves instead of calling ``vllm serve`` so that minrl
+can add endpoints (see ``router``) and hook the engine as training needs grow.
 Usage::
 
     vllm_server Qwen/Qwen3-0.6B --port 8000
@@ -7,32 +10,31 @@ Usage::
 from __future__ import annotations
 
 import os
-import sys
 import signal
+import sys
 from argparse import Namespace
 from typing import List, Optional, Sequence
 
 import uvloop
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
-from vllm.entrypoints.launcher import serve_http
-from vllm.entrypoints.openai.api_server import (
-    build_app,
-    build_async_engine_client,
-    init_app_state,
-    setup_server,
-)
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.async_llm_engine import AsyncLLMEngine
-from vllm.usage.usage_lib import UsageContext
-from vllm.logger import init_logger
+from vllm.entrypoints.launchers.api_server.app_state import init_app_state
+from vllm.entrypoints.launchers.api_server.entry import build_async_engine_client
+from vllm.entrypoints.launchers.app import build_app
+from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.launchers.launcher import serve_http, setup_server
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-logger = init_logger("minrl.inference.server")
 
 _TOKEN_ID_FLAG = "--return-tokens-as-token-ids"
 _NO_TOKEN_ID_FLAG = "--no-return-tokens-as-token-ids"
+
+# minrl's own endpoints live under /minrl;
+router = APIRouter(prefix="/minrl")
+
+
+@router.get("/health")
+async def health(request: Request) -> dict:
+    """Liveness plus what is being served, for trainers waiting on startup."""
+    return {"status": "ok", "model": request.app.state.args.model}
 
 
 def build_serve_argv(model: str, extra: Sequence[str] = ()) -> List[str]:
@@ -46,37 +48,38 @@ def build_serve_argv(model: str, extra: Sequence[str] = ()) -> List[str]:
 
 
 async def run_server(args: Namespace) -> None:
-    """Serve ``args.model`` with vLLM's OpenAI-compatible app."""
+    """Serve ``args.model`` with vLLM's app extended by ``router``."""
     listen_address, sock = setup_server(args, reuse_port=False)
+
     def signal_handler(*_) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, signal_handler)
-    engine_args = AsyncEngineArgs.from_cli_args(args)
-    engine = AsyncLLMEngine.from_engine_args(
-        engine_args, usage_context=UsageContext.OPENAI_API_SERVER
-    )
-    app = build_app(args)
 
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async with build_async_engine_client(args) as engine:
+        supported_tasks = await engine.get_supported_tasks()
+        app = build_app(args, supported_tasks, engine.model_config)
+        app.include_router(router)
+        await init_app_state(engine, app.state, args, supported_tasks)
+        app.state.args = args
+        print(f"minrl: serving {args.model} on {listen_address}", flush=True)
+        shutdown_task = await serve_http(
+            app,
+            sock=sock,
+            host=args.host,
+            port=args.port,
+            log_level=args.uvicorn_log_level,
+            access_log=not args.disable_uvicorn_access_log,
+            ssl_keyfile=args.ssl_keyfile,
+            ssl_certfile=args.ssl_certfile,
+            ssl_ca_certs=args.ssl_ca_certs,
+            ssl_cert_reqs=args.ssl_cert_reqs,
+        )
+    try:
+        await shutdown_task
+    finally:
+        sock.close()
 
-
-    await init_app_state(engine, app.state, args)
-    shutdown_task = await serve_http(
-        app,
-        sock=sock,
-        host=args.host,
-        port=args.port,
-        log_level=args.uvicorn_log_level,
-        ssl_keyfile=args.ssl_keyfile,
-        ssl_certfile=args.ssl_certfile,
-        ssl_ca_certs=args.ssl_ca_certs,
-        ssl_cert_reqs=args.ssl_cert_reqs,
-    )
-    await shutdown_task
-    sock.close()
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     raw = list(sys.argv[1:] if argv is None else argv)
@@ -96,7 +99,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args.return_tokens_as_token_ids = True
     args.worker_extension_cls = "minrl.inference.weight_sync.WeightSyncWorkerExtension"
 
-    print(f"minrl: serving {args.model} on {args.host}:{args.port}", flush=True)
     uvloop.run(run_server(args))
 
 

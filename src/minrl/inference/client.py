@@ -13,7 +13,7 @@ class InferenceClient(ABC):
     """
 
     @abstractmethod
-    def complete_tokens(
+    async def complete_tokens(
         self,
         prompt_token_ids: List[int],
         *,

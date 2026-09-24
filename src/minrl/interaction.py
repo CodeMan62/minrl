@@ -1,3 +1,4 @@
+"""How agents and envs meet to produce experience."""
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
@@ -6,15 +7,15 @@ from minrl.types import Rollout, Step
 from minrl.agents.agent import BaseAgent
 
 
-# interaction between agent and environment
-def episode(
+async def episode(
     agent: BaseAgent, env: env, max_steps: int = 100, *, seed: Optional[int] = None
 ) -> Rollout:
     """Act/step until the env ends, the agent runs out of context, or ``max_steps``."""
+    agent.reset()
     r = Rollout(index=0, steps=[], total_reward=0, terminated=False, truncated=False, info={})
     obs, _ = env.reset(seed=seed)
     for step in range(max_steps):
-        action = agent.act(obs)
+        action = await agent.act(obs)
         out = env.step(action)
         span = getattr(agent, "last_span", None)
         r.steps.append(Step(
@@ -51,25 +52,24 @@ def episode(
 class InteractionProtocol(ABC):
     """Defines *how* agents and an env interact to produce experience.
 
-    ``run()`` returns one :class:`Rollout` per learning-agent perspective, so
-    single-agent setups return a list of length 1 while self-play returns one
-    rollout per player. The trainer only calls ``run()`` and stays agnostic to
-    the interaction style (single-turn, multi-turn, self-play, ...).
+    ``run(seed)`` plays one episode and returns one :class:`Rollout` per
+    learning-agent perspective: a single-agent setup returns a list of length
+    1, self-play one rollout per player. A protocol owns its agent(s) and env,
+    both stateful, so one protocol instance never runs two episodes at once.
     """
 
     @abstractmethod
-    def run(self) -> List[Rollout]:
+    async def run(self, seed: Optional[int] = None) -> List[Rollout]:
         ...
 
 
 class SingleAgentProtocol(InteractionProtocol):
-    """One agent interacting with one env for ``num_steps`` (auto-resetting)."""
+    """One agent playing one env for at most ``max_steps`` per episode."""
 
-    def __init__(self, env: env, agent: BaseAgent, num_steps: int):
-        self.env = env
+    def __init__(self, agent: BaseAgent, env: env, max_steps: int = 100):
         self.agent = agent
-        self.num_steps = num_steps
+        self.env = env
+        self.max_steps = max_steps
 
-    def run(self) -> List[Rollout]:
-        self.agent.reset()
-        return [episode(self.agent, self.env, self.num_steps)]
+    async def run(self, seed: Optional[int] = None) -> List[Rollout]:
+        return [await episode(self.agent, self.env, self.max_steps, seed=seed)]

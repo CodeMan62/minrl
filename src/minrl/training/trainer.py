@@ -73,6 +73,7 @@ class Trainer:
 
         # 2. credit assignment -- rewards become the weight each token carries
         items, metrics = algo.estimator(batch)
+        metrics = {**{k: float(v) for k, v in batch.meta.items() if isinstance(v, (int, float))}, **metrics}
 
         # Counts over the whole step, across every rank.
         world = dist.world_size()

@@ -5,7 +5,7 @@ from minrl.types import Rollout
 
 class BaseAgent(ABC):
     @abstractmethod
-    def act(self, obs):
+    async def act(self, obs):
         """Choose an action for the current observation."""
         ...
 

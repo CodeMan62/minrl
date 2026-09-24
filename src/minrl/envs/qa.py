@@ -18,16 +18,13 @@ DEFAULT_QA_SYSTEM_PROMPT = (
 class QAEnv(SingleAgentEnv):
     """One question per episode, scored by ``reward_fn`` in a single step.
 
-    ``reset()`` serves a question; ``step(completion)`` scores the raw
-    completion text against the gold answer and terminates. Pair it with
+    ``reset(seed)`` serves question ``seed % len(pairs)``, so a group of
+    episodes that share a seed share a prompt, the setting where
+    group-relative advantages mean something. Without a seed the questions
+    are served in order. ``step(completion)`` scores the raw completion text
+    against the gold answer and terminates. Pair it with
     :class:`~minrl.inference.parser.TextParser` so the agent's action is the
     completion itself.
-
-    ``repeat`` serves the same question for that many consecutive resets.
-    Set it to GRPO's ``group_size`` so every group shares one prompt — the
-    setting where group-normalized advantages are meaningful. Anything that
-    resets the env out-of-band (e.g. a mid-training eval) desyncs this
-    cycling, so evaluate on a separate env instance.
     """
 
     def __init__(
@@ -36,31 +33,23 @@ class QAEnv(SingleAgentEnv):
         *,
         reward_fn: RewardFn,
         system_prompt: Optional[str] = None,
-        repeat: int = 1,
         shuffle: bool = False,
         seed: int = 0,
     ):
         if not pairs:
             raise ValueError("QAEnv got an empty dataset.")
-        if repeat < 1:
-            raise ValueError(f"repeat must be >= 1, got {repeat}.")
         self.pairs: List[QAPair] = list(pairs)
         if shuffle:
             random.Random(seed).shuffle(self.pairs)
         self.reward_fn = reward_fn
         self.system_prompt = system_prompt or DEFAULT_QA_SYSTEM_PROMPT
-        self.repeat = repeat
         self._resets = 0
         self.question: Optional[str] = None
         self.answer: Optional[str] = None
         self.is_done = True
 
-    def rewind(self) -> None:
-        """Start the question cycle over from the first pair."""
-        self._resets = 0
-
     def env_reset(self, seed: Optional[int] = None) -> Tuple[Observation, Info]:
-        self._index = (self._resets // self.repeat) % len(self.pairs)
+        self._index = (self._resets if seed is None else seed) % len(self.pairs)
         self.question, self.answer = self.pairs[self._index]
         self._resets += 1
         self.is_done = False
