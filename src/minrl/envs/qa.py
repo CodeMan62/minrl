@@ -1,4 +1,5 @@
 
+import inspect
 import random
 import re
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -48,19 +49,22 @@ class QAEnv(SingleAgentEnv):
         self.answer: Optional[str] = None
         self.is_done = True
 
-    def env_reset(self, seed: Optional[int] = None) -> Tuple[Observation, Info]:
+    async def env_reset(self, seed: Optional[int] = None) -> Tuple[Observation, Info]:
         self._index = (self._resets if seed is None else seed) % len(self.pairs)
         self.question, self.answer = self.pairs[self._index]
         self._resets += 1
         self.is_done = False
         return self.get_obs(), {"question_index": self._index}
 
-    def env_step(self, action) -> StepOutPut:
+    async def env_step(self, action) -> StepOutPut:
         if self.is_done:
             raise RuntimeError("step() called after episode is done. Call reset()")
         self.is_done = True
         completion = action if isinstance(action, str) else ""
-        reward = float(self.reward_fn(completion, self.answer))
+        # ``reward_fn`` may be a plain function (GSM8K's regex check) or a
+        # coroutine function (a future judge-model rubric); either works.
+        result = self.reward_fn(completion, self.answer)
+        reward = float(await result if inspect.isawaitable(result) else result)
         return StepOutPut(
             obs=self.get_obs(),
             reward=reward,

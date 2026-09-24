@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 import json
 import re
 from typing import Callable, Dict, List, Optional
@@ -90,13 +92,17 @@ class LLMAgent(BaseAgent):
             stop_token_ids=[eos_token_id] if eos_token_id is not None else None,
         )
 
-    def _call_tool(self, raw: str) -> str:
-        # Bad JSON, unknown tool or a tool crash come back as text, not an exception.
+    async def _call_tool(self, raw: str) -> str:
+        # Failures come back as text, not exceptions; sync tools run in a thread so they never stall the loop.
         try:
             call = json.loads(raw)
             fn = self.tools[call["name"]]
             args = call.get("arguments") or {}
-            out = fn(**args) if isinstance(args, dict) else fn(args)
+            if inspect.iscoroutinefunction(fn):
+                out = await fn(**args) if isinstance(args, dict) else await fn(args)
+            else:
+                out = await asyncio.to_thread(fn, **args) if isinstance(args, dict) \
+                    else await asyncio.to_thread(fn, args)
             return out if isinstance(out, str) else json.dumps(out)
         except Exception as e:  # noqa: BLE001
             return f"error: {type(e).__name__}: {e}"
@@ -141,7 +147,7 @@ class LLMAgent(BaseAgent):
             if not calls or self.last_tool_calls >= self.max_tool_calls or resp.finish_reason == "length":
                 break
             self.last_tool_calls += len(calls)
-            results = [self._call_tool(c) for c in calls]
+            results = await asyncio.gather(*(self._call_tool(c) for c in calls))
             seg = self.template.tool_turn_ids(results)
             ids += seg
             logprobs += [0.0] * len(seg)

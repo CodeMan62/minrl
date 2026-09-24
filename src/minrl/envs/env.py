@@ -7,11 +7,11 @@ from minrl.types import StepOutPut, Observation, Info
 class env(ABC):
     """Base class for all envs"""
     @abstractmethod
-    def reset(self, seed: Optional[int]) -> Tuple[Observation, Info]:
+    async def reset(self, seed: Optional[int]) -> Tuple[Observation, Info]:
         """"""
         ...
     @abstractmethod
-    def step(self, action) -> StepOutPut:
+    async def step(self, action) -> StepOutPut:
         """"""
         ...
     @abstractmethod
