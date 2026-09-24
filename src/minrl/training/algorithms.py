@@ -27,6 +27,7 @@ def grpo(
     *,
     clip_eps: float = 0.2,
     kl_coef: float = 0.0,
+    ent_coef: float = 0.0,
     group_size: Optional[int] = None,
 ) -> Algorithm:
     """Group Relative Policy Optimization (DeepSeekMath, arXiv:2402.03300)::
@@ -42,7 +43,7 @@ def grpo(
         estimator=partial(estim.group_relative, group_size=group_size),
         loss=partial(
             loss.clipped_surrogate, agg="seq-mean",
-            clip_eps=clip_eps, kl_coef=kl_coef,
+            clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef,
         ),
     )
 
@@ -52,6 +53,7 @@ def dr_grpo(
     max_tokens: int,
     clip_eps: float = 0.2,
     kl_coef: float = 0.0,
+    ent_coef: float = 0.0,
     group_size: Optional[int] = None,
 ) -> Algorithm:
     """Dr. GRPO (arXiv:2503.20783).
@@ -61,7 +63,7 @@ def dr_grpo(
         estimator=partial(estim.group_relative, group_size=group_size, std=False),
         loss=partial(
             loss.clipped_surrogate, agg="budget", max_tokens=max_tokens,
-            clip_eps=clip_eps, kl_coef=kl_coef,
+            clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef,
         ),
     )
 
@@ -70,6 +72,7 @@ def cispo(
     *,
     eps_low: float = 0.2,
     eps_high: float = 4.0,
+    ent_coef: float = 0.0,
     group_size: Optional[int] = None,
 ) -> Algorithm:
     """Clipped IS-weight Policy Optimization (MiniMax-M1, arXiv:2506.13585)::
@@ -81,19 +84,19 @@ def cispo(
         estimator=partial(estim.group_relative, group_size=group_size),
         loss=partial(
             loss.cispo_surrogate, agg="token-mean",
-            eps_low=eps_low, eps_high=eps_high,
+            eps_low=eps_low, eps_high=eps_high, ent_coef=ent_coef,
         ),
     )
 
 
-def reinforce(*, gamma: float = 1.0, baseline: bool = True) -> Algorithm:
+def reinforce(*, gamma: float = 1.0, baseline: bool = True, ent_coef: float = 0.0) -> Algorithm:
     """Vanilla policy gradient with a Monte-Carlo return estimate::
         grad J = 1/N sum_i sum_t (G_t - b) grad log pi(a_t | s_t)
     """
     return Algorithm(
         name="reinforce",
         estimator=partial(estim.monte_carlo, gamma=gamma, baseline=baseline),
-        loss=partial(loss.score_function, agg="seq-sum"),
+        loss=partial(loss.score_function, agg="seq-sum", ent_coef=ent_coef),
     )
 
 

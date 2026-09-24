@@ -56,10 +56,21 @@ def forward(model, p: Packed) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def logprobs(model, seqs: Seq[Sequence]) -> Tuple[Packed, torch.Tensor]:
-    """Pack and run ``seqs`` -> ``(packed, per-token logprobs)``."""
+def logprobs(model, seqs: Seq[Sequence]) -> Tuple[Packed, torch.Tensor, torch.Tensor]:
+    """Pack and run ``seqs`` -> ``(packed, logits, per-token logprobs)``."""
     p = pack(seqs, device_of(model))
-    return p, forward(model, p)[1]
+    logits, logp = forward(model, p)
+    return p, logits, logp
+
+
+def entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Per-token entropy of the policy, in nats: ``logsumexp(z) - sum_v p_v z_v``.
+
+    How undecided the policy is over the whole vocabulary at each position,
+    unlike ``logp``, which only scores the one token that was sampled.
+    """
+    logits = logits.float()
+    return logits.logsumexp(-1) - (logits.softmax(-1) * logits).sum(-1)
 
 
 def reduce(
@@ -108,6 +119,7 @@ def clipped_surrogate(
     clip_eps: float,
     ref_model=None,
     kl_coef: float = 0.0,
+    ent_coef: float = 0.0,
     max_tokens: Optional[int] = None,
     **_,
 ) -> Tuple[torch.Tensor, Aux]:
@@ -115,14 +127,15 @@ def clipped_surrogate(
 
         rho_t = pi_theta(o_t) / pi_old(o_t)
         L = -E_t[ min(rho_t * A, clip(rho_t, 1-eps, 1+eps) * A)
-                  - beta * KL(pi_theta || pi_ref) ]
+                  - beta * KL(pi_theta || pi_ref) + alpha * H ]
     """
-    p, logp = logprobs(model, seqs)
+    p, logits, logp = logprobs(model, seqs)
     ratio = torch.exp(logp - p.old_logp)
     a = p.adv
     surrogate = torch.minimum(ratio * a, ratio.clamp(1 - clip_eps, 1 + clip_eps) * a)
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, clip_eps, clip_eps)}
+    surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
     if kl_coef:
         if ref_model is None:
             raise ValueError("kl_coef > 0 needs ref_model=<frozen policy>")
@@ -145,6 +158,7 @@ def cispo_surrogate(
     n_tokens: float,
     eps_low: float,
     eps_high: float,
+    ent_coef: float = 0.0,
     **_,
 ) -> Tuple[torch.Tensor, Aux]:
     """CISPO's clipped importance-weight objective::
@@ -157,23 +171,26 @@ def cispo_surrogate(
     any token that strays out of the trust region, CISPO keeps every token's
     gradient and only bounds how loudly it speaks.
     """
-    p, logp = logprobs(model, seqs)
+    p, logits, logp = logprobs(model, seqs)
     ratio = torch.exp(logp - p.old_logp)
     surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv * logp
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, eps_low, eps_high)}
+    surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
     return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
 
 
 def score_function(
-    model, seqs: Seq[Sequence], *, agg: str, n_seqs: float, n_tokens: float, **_
+    model, seqs: Seq[Sequence], *, agg: str, n_seqs: float, n_tokens: float,
+    ent_coef: float = 0.0, **_
 ) -> Tuple[torch.Tensor, Aux]:
     """REINFORCE's score-function estimator::
-        L = -E_t[ A_t * log pi_theta(a_t | s_t) ]
+        L = -E_t[ A_t * log pi_theta(a_t | s_t) + alpha * H ]
     """
-    p, logp = logprobs(model, seqs)
-    return -reduce(p.adv * logp, p.mask, agg=agg, n_seqs=n_seqs,
-                   n_tokens=n_tokens), {}
+    p, logits, logp = logprobs(model, seqs)
+    aux: Aux = {}
+    surrogate = _add_entropy(p.adv * logp, logits, p.mask, n_tokens, ent_coef, aux)
+    return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
 
 
 def cross_entropy(
@@ -187,7 +204,10 @@ def cross_entropy(
 
     with torch.no_grad():
         hits = (logits.argmax(dim=-1) == p.targets).float()
-        aux = {"token_acc": _masked_mean(hits, p.mask, n_tokens)}
+        aux = {
+            "token_acc": _masked_mean(hits, p.mask, n_tokens),
+            "entropy": _masked_mean(entropy(logits), p.mask, n_tokens),
+        }
 
     return -reduce(logp, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
 
@@ -230,6 +250,20 @@ def preference(
 def device_of(model) -> torch.device:
     """The device ``model``'s parameters live on."""
     return next(model.parameters()).device
+
+
+def _add_entropy(
+    surrogate: torch.Tensor, logits: torch.Tensor, mask: torch.Tensor,
+    n_tokens: float, ent_coef: float, aux: Aux,
+) -> torch.Tensor:
+    """Log mean policy entropy, and add ``ent_coef * H`` to the surrogate.
+
+    With ``ent_coef=0`` entropy is a metric only, computed without a graph.
+    """
+    with torch.set_grad_enabled(bool(ent_coef)):
+        ent = entropy(logits)
+    aux["entropy"] = _masked_mean(ent, mask, n_tokens)
+    return surrogate + ent_coef * ent if ent_coef else surrogate
 
 
 def _seq_logp(model, p: Packed) -> torch.Tensor:
