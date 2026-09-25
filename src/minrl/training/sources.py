@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import random
 import threading
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from minrl.rollout_engine import Actor, Group, RolloutEngine
 from minrl.types import Batch, BatchSource
@@ -67,6 +67,15 @@ class RolloutSource(BatchSource):
         """Cancel one in-flight request by id; the hop lands Task.cancel() on the engine's loop."""
         return self._call(self._cancel(request_id))
 
+    async def _state(self) -> Dict[str, int]:
+        return self.engine.state_dict()
+
+    def state_dict(self) -> Dict[str, int]:
+        return self._call(self._state())
+
+    def load_state_dict(self, state: Dict[str, int]) -> None:
+        self._call(self.engine.restore(state))
+
     def close(self) -> None:
         """Cancel every in-flight request and stop the background loop."""
         self._call(self.engine.aclose())
@@ -115,3 +124,10 @@ class DatasetSource(BatchSource):
             self._order = self._order[len(take) :]
             picked.extend(self.examples[j] for j in take)
         return Batch(examples=picked, meta={"epoch": self.epoch})
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"epoch": self.epoch, "order": list(self._order), "rng": self.rng.getstate()}
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.epoch, self._order = state["epoch"], list(state["order"])
+        self.rng.setstate(state["rng"])

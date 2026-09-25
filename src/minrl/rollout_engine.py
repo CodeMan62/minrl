@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -40,7 +39,7 @@ class RolloutEngine:
         self.group_size = group_size
         self.concurrency = concurrency
         self.tick = 0
-        self._seeds = itertools.count(seed)
+        self.next_seed = seed
         self._queue: "asyncio.Queue[tuple]" = asyncio.Queue(maxsize=max_queued or concurrency)
         self._requests: Dict[str, asyncio.Task] = {}
         self._closed = False
@@ -103,7 +102,8 @@ class RolloutEngine:
 
     def _submit(self) -> str:
         """Launch one request; returns its id without waiting for it."""
-        request_id, seed = uuid.uuid4().hex, next(self._seeds)
+        request_id, seed = uuid.uuid4().hex, self.next_seed
+        self.next_seed += 1
         requests = [RolloutRequest(*self.make(), seed=seed) for _ in range(self.group_size)]
         task = asyncio.ensure_future(self._play(request_id, requests, self.tick))
         self._requests[request_id] = task
@@ -151,3 +151,19 @@ class RolloutEngine:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ---- checkpointing ---------------------------------------------------
+
+    def state_dict(self) -> Dict[str, int]:
+        """The seed cursor and clock. Requests in flight or queued at save time
+        are not replayed on restore; their prompts simply come round again."""
+        return {"next_seed": self.next_seed, "tick": self.tick}
+
+    async def restore(self, state: Dict[str, int]) -> None:
+        """Drop everything in flight and continue from ``state``'s cursor."""
+        await self.aclose()
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        self.next_seed, self.tick = state["next_seed"], state["tick"]
+        self._closed = False
+        await self.__aenter__()
