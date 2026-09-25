@@ -1,3 +1,5 @@
+import asyncio
+import weakref
 from typing import List, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -32,7 +34,19 @@ class VLLMClient(InferenceClient):
     def __init__(self, base_url: str, model: str, api_key: str = "local"):
         self.base_url = base_url
         self.model = model
-        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self.api_key = api_key
+        # One AsyncOpenAI per event loop: its connection pool is bound to the loop
+        # that first used it, and training and eval each run on their own loop.
+        self._clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, AsyncOpenAI]" = (
+            weakref.WeakKeyDictionary()
+        )
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        loop = asyncio.get_running_loop()
+        if loop not in self._clients:
+            self._clients[loop] = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        return self._clients[loop]
 
     async def complete_tokens(
         self,
