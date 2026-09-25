@@ -68,7 +68,8 @@ class RolloutEngine:
                 token_ids=None if span else getattr(agent, "last_token_ids", None),
                 logprobs=None if span else getattr(agent, "last_logprobs", None),
                 action_mask=None if span else getattr(agent, "last_action_mask", None),
-                span=span))
+                span=span,
+                finish_reason=getattr(agent, "last_finish_reason", None)))
             r.total_reward += out.reward
             r.terminated = out.terminated
             r.truncated = out.truncated

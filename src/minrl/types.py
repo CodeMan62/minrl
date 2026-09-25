@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, Union, Any, List, Optional, Tuple
-from minrl.agents.agent import BaseAgent
-from minrl.envs.env import env
+from typing import Dict, Union, Any, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # both import types.py at runtime; eager imports here are a cycle
+    from minrl.agents.agent import BaseAgent
+    from minrl.envs.env import env
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
@@ -26,6 +30,7 @@ class Step:
     action_mask: Optional[List[int]] = None
     # multi-turn mode: this step's slice of the rollout's sequence
     span: Optional[Span] = None
+    finish_reason: Optional[str] = None  # the sampler's, e.g. "stop" or "length"
 @dataclass
 class Rollout:
     index: int

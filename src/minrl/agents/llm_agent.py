@@ -61,6 +61,7 @@ class LLMAgent(BaseAgent):
     def reset(self) -> None:
         self.history: List[Message] = []
         self.last_text: Optional[str] = None
+        self.last_finish_reason: Optional[str] = None
         self.last_move: Optional[int] = None
         self.last_token_ids: Optional[List[int]] = None
         self.last_logprobs: Optional[List[float]] = None
@@ -130,6 +131,7 @@ class LLMAgent(BaseAgent):
         ids, logprobs, mask, start = self._start_turn(obs)
         turns: List[Message] = []
         self.last_tool_calls = 0
+        self.last_finish_reason = None
         text = ""
 
         while True:
@@ -142,6 +144,7 @@ class LLMAgent(BaseAgent):
             mask += [1] * len(resp.token_idx)
             turns.append({"role": "assistant", "content": resp.text})
             text = resp.text
+            self.last_finish_reason = resp.finish_reason
 
             calls = _TOOL_CALL.findall(resp.text) if self.tools else []
             if not calls or self.last_tool_calls >= self.max_tool_calls or resp.finish_reason == "length":
