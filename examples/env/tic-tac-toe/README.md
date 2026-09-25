@@ -1,133 +1,90 @@
-# TicTacToe examples
+# Tic-tac-toe
 
-minrl using an LLM playing `TicTacToe` (from the top-level
-`enviornments/` package) against a random opponent.
+An LLM learns to beat a random opponent at tic-tac-toe with GRPO. The env
+lives in the top-level `enviornments/` package.
 
-| File | What it does |
-|---|---|
-| `train_grpo.py` | Trains Qwen3-0.6B with GRPO so its win rate vs the random opponent goes up. |
-| `tic-tac-toe-vllm.py` | Single inference call against a vLLM server; prints the token trace (ids, logprobs, action mask) the trainer consumes. Sanity-check for the vLLM path, no training. |
+## Hardware
 
-## Prerequisites
+Two GPUs on one host. One serves the policy with vLLM for rollouts, the other
+trains. After every optimizer step the trainer pushes its weights into the
+server over NCCL, which is why both must share a host.
 
-- Python >= 3.12 with the repo installed (`torch`, `transformers`, `openai`).
-- Internet access on first run to download `Qwen/Qwen3-0.6B` (~1.5 GB) from
-  the HF Hub.
-
-**Hardware for `train_grpo.py`:** two GPUs. One serves the model with vLLM
-for rollouts; the other trains. After every optimizer step the trainer pushes
-its weights into the server over NCCL, so the server and trainer must share a
-host.
-
-`tic-tac-toe-vllm.py` needs whatever GPU your vLLM server runs on; the script
-itself is just a client.
-
-## Train with GRPO
-
+## Train
+Run vllm server in terminal 1:-
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm_server Qwen/Qwen3-0.6B \
     --gpu-memory-utilization 0.7 --weight-transfer-config '{"backend":"nccl"}'
+```
+Run training on terminal 2:-
+
+```bash
 CUDA_VISIBLE_DEVICES=1 python examples/env/tic-tac-toe/train_grpo.py
 ```
 
-Defaults: 150 iterations, 8 episodes per GRPO group, lr 5e-6, win-rate eval
-(greedy decoding, 50 games) before training, every 25 iterations, and at the
-end. Expect roughly 15–30 min on a modern GPU.
-
-Common knobs:
+Or on GPUs 1-3 with FSDP2, one rank per GPU:
 
 ```bash
-python examples/env/tic-tac-toe/train_grpo.py \
-    --iterations 150 --group-size 8 --lr 5e-6 \
-    --eval-every 25 --eval-games 50
+CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 examples/env/tic-tac-toe/train_grpo.py
 ```
 
-If the win rate climbs too slowly, try `--lr 1e-5` and/or `--group-size 16`.
+Defaults: 150 steps, 8 games per GRPO group, lr 5e-6, a checkpoint every
+2 steps, and an eval of 50 greedy games before training, every 25 steps, and
+at the end.
 
-Notes:
+## Knobs
 
-- Rollouts come from the vLLM server; weights are synced after every step,
-  so each group is sampled from the current policy.
-- Rewards: +1 win, 0 draw, -1 loss, -1 illegal/unparseable move (the episode
-  ends on an illegal move).
-- A `loss=0 ... skipped` iteration means every episode in the group got the
-  same return, so all advantages are zero — normal at small group sizes.
+| Flag | Default | What it does |
+|---|---|---|
+| `--iterations` | 150 | optimizer steps |
+| `--group-size` | 8 | games per group; GRPO advantages are relative within a group |
+| `--lr` | 5e-6 | if the win rate climbs slowly, try 1e-5 or a bigger group |
+| `--multi-turn` | off | one sequence per game, so the policy sees every earlier board and its own moves |
+| `--concurrency` | 2 | groups generating at once while the trainer steps |
+| `--ent-coef` | 0 | entropy bonus; 0 still logs `train/entropy` |
+| `--ckpt-every` | 2 | checkpoint every N steps; 0 = only at the end |
+| `--keep-last` | 3 | `step_*` checkpoints kept; older ones are deleted after a good save |
+| `--resume` | none | a checkpoint path, or `auto` for the newest under `--ckpt-dir` |
+| `--eval-every` / `--eval-games` | 25 / 50 | when and how many games to eval |
+| `--eval-concurrency` | 16 | eval games played at once |
+| `--eval-dump` | none | directory for per-game jsonl, to read what the model actually played |
 
-## Tracking training with W&B
+## Crash and resume
 
-W&B logging is built into the library: `minrl.loggers.WandbLogger` wraps a
-W&B run, and any logger passed to `grpo()` gets the per-iteration
-`train/*` metrics automatically:
+Restart with the same command plus `--resume auto`. Training continues from
+the newest checkpoint with the same weights, optimizer state, RNG, step and
+token counters, and rollout cursor. With the default `--ckpt-every 2` a crash
+costs at most one finished step.
+
+## W&B
+
+```bash
+pip install wandb && wandb login
+python examples/env/tic-tac-toe/train_grpo.py --wandb
+```
+
+Logging is off by default; `--wandb` turns it on, and the run URL is printed
+at the start. Useful charts:
+
+- **`eval/success`**, the headline: win rate against the random opponent.
+- **`eval/label/illegal`** should fall as the policy learns the rules.
+- `eval/label/win`, `draw`, `loss` break down the rest.
+- `train/mean_return`, `loss`, `entropy`, `clip_frac`, `grad_norm`,
+  `staleness`, `tokens`.
+
+The run summary records `win_rate_before`, `win_rate_after`, and
+`win_rate_delta` for comparing runs. For offline boxes, run with
+`WANDB_MODE=offline` and `wandb sync wandb/offline-run-*` later.
+
+## Eval on its own
+
+Any saved policy that vLLM is serving can be evaluated without training:
 
 ```python
-from minrl.algorithms import grpo
-from minrl.loggers import WandbLogger
+from minrl.eval import Eval, EvalConfig
 
-logger = WandbLogger(project="minrl-tictactoe")   # kwargs go to wandb.init
-history = [metrics for _, metrics in grpo(model, agent, env, logger=logger)]
-logger.finish()
+Eval(EvalConfig(num_episodes=50, max_steps=9), make,
+     success=lambda r: outcome(r) == "win", label=outcome).evaluate_sync()
 ```
 
-`train_grpo.py` does exactly this (plus extra eval metrics) when `wandb` is
-installed; otherwise it prints a note and trains without it.
-
-One-time setup:
-
-```bash
-pip install wandb        # or: pip install -e ".[examples]"
-wandb login              # paste your API key from https://wandb.ai/authorize
-```
-
-Then just run training as usual — the run URL is printed at start and end:
-
-```bash
-python examples/env/tic-tac-toe/train_grpo.py
-# W&B run: https://wandb.ai/<your-entity>/minrl-tictactoe/runs/<run-id>
-```
-
-Viewing the logs:
-
-- Open the printed URL, or browse all runs at
-  `https://wandb.ai/<your-entity>/minrl-tictactoe`.
-- **`eval/win_rate`** is the headline chart — win rate vs the random opponent
-  at iteration 0, every `--eval-every` iterations, and at the end. It should
-  trend up; `eval/illegal_rate` should trend down.
-- `train/*` charts show per-iteration signals — `grpo()` logs
-  `mean_return`, `std_return`, `loss`, `n_tokens`, and `skipped` (1 when a
-  zero-variance group skipped the update); the example script adds
-  `win_rate` / `illegal_rate` within each training group.
-- The run summary records `win_rate_before` / `win_rate_after` /
-  `win_rate_delta` for quick comparison across runs.
-
-Useful variants:
-
-```bash
-# name the run / use a different project
-python examples/env/tic-tac-toe/train_grpo.py \
-    --wandb-run-name qwen3-0.6b-lr5e-6 --wandb-project my-project
-
-# no internet on the training box: log offline, sync later
-WANDB_MODE=offline python examples/env/tic-tac-toe/train_grpo.py
-wandb sync wandb/offline-run-*        # from the same directory, once online
-
-# disable W&B entirely
-python examples/env/tic-tac-toe/train_grpo.py --no-wandb
-```
-
-## vLLM inference check
-
-Start a server (the flag is required so the sampled token *ids* can be
-recovered for training):
-
-```bash
-uv run vllm_server Qwen/Qwen3-0.6B
-```
-
-Then:
-
-```bash
-python examples/env/tic-tac-toe/tic-tac-toe-vllm.py
-# or point elsewhere:
-MINRL_BASE_URL=http://localhost:8000/v1 MINRL_MODEL=Qwen/Qwen3-0.6B \
-    python examples/env/tic-tac-toe/tic-tac-toe-vllm.py
-```
+`outcome` is the function in `train_grpo.py`. Build `make` the way
+`make_actor(0.0)` does there, returning a fresh `(LLMAgent, TicTacToe())` pair.

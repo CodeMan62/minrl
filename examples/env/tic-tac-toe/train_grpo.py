@@ -12,9 +12,6 @@ Then train on GPU 1::
 or on GPUs 1-3 with FSDP2 (one rank per GPU, each playing its own games)::
 
     CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 examples/env/tic-tac-toe/train_grpo.py
-
-After every optimizer step the trainer broadcasts its weights to vLLM, so the
-next group is sampled from the updated policy.
 """
 
 import argparse
@@ -28,10 +25,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from minrl.agents.llm_agent import LLMAgent
 from minrl.inference.chat_template import HFChatTemplate
 from minrl.inference.parser import MoveParser
+from minrl.eval import Eval, EvalConfig
 from minrl.inference.vllm_client import VLLMClient, vllm_weight_synchronizer
-from minrl.interaction import episode
 from minrl.loggers import make_logger
-from minrl.training import dist
+from minrl.training import checkpoint, dist
 from minrl.training.algorithms import grpo
 from minrl.training.config import TrainerConfig
 from minrl.training.sources import RolloutSource
@@ -68,12 +65,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--micro-batch-size", type=int, default=4)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--clip-eps", type=float, default=0.2)
+    p.add_argument("--ent-coef", type=float, default=0.0,
+                   help="entropy bonus; 0 logs entropy without steering it")
+    p.add_argument("--concurrency", type=int, default=2,
+                   help="groups playing at once while the trainer steps")
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-games", type=int, default=50)
+    p.add_argument("--eval-concurrency", type=int, default=16)
+    p.add_argument("--eval-dump", default=None, help="dir for per-rollout jsonl dumps")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-dir", default="ckpts/tic-tac-toe")
-    p.add_argument("--ckpt-every", type=int, default=0, help="0 = only at the end")
-    p.add_argument("--resume", default=None, help="checkpoint dir to continue from")
+    p.add_argument("--ckpt-every", type=int, default=2,
+                   help="checkpoint every N steps; 0 = only at the end")
+    p.add_argument("--resume", default=None,
+                   help="checkpoint to continue from, or 'auto' for the newest under --ckpt-dir")
+    p.add_argument("--keep-last", type=int, default=3, help="step_* checkpoints to keep; 0 = all")
     p.add_argument("--wandb", dest="no_wandb", action="store_false")
     p.add_argument("--no-wandb", dest="no_wandb", action="store_true")
     p.add_argument("--wandb-project", default="minrl-tictactoe")
@@ -82,25 +88,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def evaluate(agent: LLMAgent, env: TicTacToe, games: int) -> dict:
-    """Play ``games`` full games greedily; report win/draw/loss/illegal rates."""
-    counts = {"win": 0, "draw": 0, "loss": 0, "illegal": 0}
-    for _ in range(games):
-        agent.reset()
-        r = episode(agent, env, max_steps=9)
-        last = r.steps[-1]
-        if last.info.get("illegal_move"):
-            counts["illegal"] += 1
-        else:
-            counts[last.info.get("result", "loss")] += 1
-    return {k: v / games for k, v in counts.items()}
-
-
-def fmt_eval(tag: str, e: dict) -> str:
-    return (
-        f"{tag}: win {e['win']:.0%} | draw {e['draw']:.0%} | "
-        f"loss {e['loss']:.0%} | illegal {e['illegal']:.0%}"
-    )
+def outcome(r) -> str:
+    """How a game ended, from the final step's info."""
+    info = r.steps[-1].info
+    return "illegal" if info.get("illegal_move") else info.get("result", "loss")
 
 
 def main() -> None:
@@ -124,17 +115,23 @@ def main() -> None:
     # enable_thinking=False: Qwen3 answers directly instead of spending the
     # token budget on a <think> block.
     template = HFChatTemplate(tokenizer, template_kwargs={"enable_thinking": False})
-    parser = MoveParser()
-    env = TicTacToe()
 
-    # Training samples at T=1.0 so behaviour logprobs match the raw policy;
-    # eval decodes greedily (T=0) against the same random opponent.
-    agent_kw = dict(
-        system_prompt=SYSTEM_PROMPT, max_tokens=args.max_new_tokens,
-        multi_turn=args.multi_turn, max_seq_len=args.max_seq_len if args.multi_turn else None,
-    )
-    train_agent = LLMAgent(client, template, parser, temperature=1.0, **agent_kw)
-    eval_agent = LLMAgent(client, template, parser, temperature=0.0, **agent_kw)
+    # Each ``make()`` builds a fresh (agent, env) pair -- both stateful, and
+    # games run concurrently. Training samples at T=1.0 so behaviour logprobs
+    # match the raw policy; eval decodes greedily (T=0) against the same
+    # random opponent.
+    def make_actor(temperature: float):
+        def make():
+            agent = LLMAgent(
+                client, template, MoveParser(), system_prompt=SYSTEM_PROMPT,
+                max_tokens=args.max_new_tokens, temperature=temperature,
+                multi_turn=args.multi_turn,
+                max_seq_len=args.max_seq_len if args.multi_turn else None,
+            )
+            return agent, TicTacToe()
+        return make
+
+    make_train, make_eval = make_actor(1.0), make_actor(0.0)
 
     synchronizer = vllm_weight_synchronizer(
         model, args.vllm_url, host=args.weight_transfer_host, port=args.weight_transfer_port,
@@ -143,8 +140,13 @@ def main() -> None:
     logger = make_logger(args) if main else None
     trainer = Trainer(
         model,
-        algorithm=grpo(clip_eps=args.clip_eps, group_size=args.group_size),
-        source=RolloutSource(train_agent, env, batch_size=args.group_size, max_episode_steps=9),
+        algorithm=grpo(clip_eps=args.clip_eps, ent_coef=args.ent_coef, group_size=args.group_size),
+        # One group per step: group_size games from one seed (same opponent
+        # moves, same side), the set the group-relative advantages are over.
+        source=RolloutSource(
+            make_train, batch_size=args.group_size, max_steps=9, group_size=args.group_size,
+            concurrency=args.concurrency, seed=args.seed + rank * 1_000_000,
+        ),
         config=TrainerConfig(
             lr=args.lr,
             eps=args.adam_eps,
@@ -153,26 +155,25 @@ def main() -> None:
             mixed_precision="fp16",
             ckpt_dir=args.ckpt_dir,
             ckpt_every=args.ckpt_every,
+            keep_last=args.keep_last,
         ),
         logger=logger,
         weight_synchronizer=synchronizer,
     )
 
+    if args.resume == "auto":
+        args.resume = checkpoint.latest(args.ckpt_dir)  # None on a fresh run
     if args.resume:
         trainer.load(args.resume)
 
     # Eval is rank 0's job: it plays through vLLM, which already holds the
     # synced policy, and the other ranks just wait at their next collective.
-    def log_eval(step: int, e: dict) -> None:
-        if logger:
-            logger.log({f"eval/{k}_rate": v for k, v in e.items()}, step=step)
-
-    evals = []
-    if main:
-        baseline = evaluate(eval_agent, env, args.eval_games)
-        print(fmt_eval("[eval] before training", baseline))
-        log_eval(trainer.step, baseline)
-        evals.append((trainer.step, baseline))
+    evaluator = Eval(
+        EvalConfig(model=args.model, num_episodes=args.eval_games, max_steps=9,
+                   concurrency=args.eval_concurrency, dump_dir=args.eval_dump),
+        make_eval, success=lambda r: outcome(r) == "win", label=outcome, logger=logger,
+    ) if main else None
+    evals = [evaluator.evaluate_sync(step=trainer.step)] if main else []
 
     for metrics in trainer.train(num_steps=args.iterations):
         step = int(metrics["step"])
@@ -185,33 +186,26 @@ def main() -> None:
             f"tokens={metrics.get('n_tokens', 0):.0f}"
         )
         if step % args.eval_every == 0 and step < args.iterations:
-            e = evaluate(eval_agent, env, args.eval_games)
-            evals.append((step, e))
-            print(fmt_eval(f"[eval] after iter {step}", e))
-            log_eval(step, e)
+            evals.append(evaluator.evaluate_sync(step=step))
 
     trainer.save(os.path.join(args.ckpt_dir, "final"))
+    trainer.close()  # stop the rollout engine before tearing down weight transfer
     synchronizer.shutdown()
     if main:
-        final = evaluate(eval_agent, env, args.eval_games)
-        evals.append((args.iterations, final))
-        log_eval(args.iterations, final)
-
+        evals.append(evaluator.evaluate_sync(step=trainer.step))
+        baseline, final = evals[0], evals[-1]
         print("\n==== win rate vs random opponent ====")
-        for it, e in evals:
-            print(f"  iter {it:>4}: {e['win']:.0%} (illegal {e['illegal']:.0%})")
-        delta = final["win"] - baseline["win"]
-        print(f"\n{fmt_eval('final', final)}")
-        print(f"win rate change: {baseline['win']:.0%} -> {final['win']:.0%} ({delta:+.0%})")
+        for e in evals:
+            print(f"  step {e.step:>4}: {e.success:.0%} (illegal {e.labels.get('illegal', 0):.0%})")
+        delta = final.success - baseline.success
+        print(f"win rate change: {baseline.success:.0%} -> {final.success:.0%} ({delta:+.0%})")
 
     if logger:
-        logger.log_summary(
-            {
-                "win_rate_before": baseline["win"],
-                "win_rate_after": final["win"],
-                "win_rate_delta": delta,
-            }
-        )
+        logger.log_summary({
+            "win_rate_before": baseline.success,
+            "win_rate_after": final.success,
+            "win_rate_delta": delta,
+        })
         url = logger.url
         logger.finish()
         print(f"W&B logs: {url}")
