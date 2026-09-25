@@ -23,7 +23,8 @@ class TrainerConfig:
 
     # --- checkpointing ---
     ckpt_dir: Optional[str] = None
-    ckpt_every: int = 0  # 0 = only on explicit trainer.save()
+    ckpt_every: int = 2  # a crash loses at most one finished step; 0 = only explicit saves
+    keep_last: int = 3  # step_* checkpoints kept under ckpt_dir; 0 = all
 
     # --- logging ---
     log_prefix: str = "train"

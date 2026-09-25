@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import os
+import warnings
+from dataclasses import asdict
 from typing import Dict, Iterator, Optional
 import torch
 import torch.optim as optim
 from torch import nn
 from minrl.loggers import Logger
-from minrl.training import dist
+from minrl.training import checkpoint, dist
 from minrl.training.algorithms import Algorithm
 from minrl.training.config import TrainerConfig
 from minrl.types import BatchSource
@@ -34,6 +36,8 @@ class Trainer:
         self.weight_synchronizer = weight_synchronizer
         self.sync_every = sync_every
         self.step = 0
+        self.tokens = 0  # action tokens trained on so far, across every rank
+        self.sequences = 0
 
         if config.activation_checkpointing:
             model.gradient_checkpointing_enable()
@@ -80,7 +84,7 @@ class Trainer:
         n_seqs, n_tokens, n_live = dist.sum_all(
             len(items), metrics["n_tokens"], metrics.get("n_live", len(items))
         )
-        metrics["n_tokens"] = n_tokens
+        metrics["n_tokens"], metrics["n_seqs"] = n_tokens, n_seqs
         if not n_live:
             # Nothing to learn from: an all-zero-advantage batch. Stepping
             # anyway would still drift the weights via momentum/weight decay.
@@ -133,11 +137,13 @@ class Trainer:
         while self.step < num_steps:
             self.step += 1
             stats = self.train_step()
+            self.tokens += int(stats["n_tokens"])
+            self.sequences += int(stats["n_seqs"])
             if self.weight_synchronizer is not None and self.step % self.sync_every == 0:
                 self.weight_synchronizer.send_weights()
             if cfg.ckpt_every and self.step % cfg.ckpt_every == 0:
-                self.save(os.path.join(cfg.ckpt_dir or "ckpts", f"step_{self.step}"))
-            stats = {**stats, "step": float(self.step)}
+                self.save()
+            stats = {**stats, "step": float(self.step), "tokens": float(self.tokens)}
             if self.logger and dist.is_main() and cfg.log_every and self.step % cfg.log_every == 0:
                 self.logger.log(
                     {f"{cfg.log_prefix}/{k}": v for k, v in stats.items() if k != "step"},
@@ -153,27 +159,48 @@ class Trainer:
 
     # ---- checkpointing --------------------------------------------------
 
-    def save(self, path: str) -> None:
-        """Write ``model.pt`` and ``trainer.pt`` under ``path``."""
+    def save(self, path: Optional[str] = None) -> None:
+        """Checkpoint everything a bit-exact resume needs. Every rank must call it."""
+        path = path or os.path.join(self.cfg.ckpt_dir or "ckpts", f"step_{self.step:08d}")
         model_state, optim_state = dist.full_state(self.model, self.optimizer)
-        if dist.is_main():
-            os.makedirs(path, exist_ok=True)
-            torch.save(model_state, os.path.join(path, "model.pt"))
-            torch.save(
-                {"optimizer": optim_state, "step": self.step},
-                os.path.join(path, "trainer.pt"),
-            )
-        dist.barrier()
+        checkpoint.save(
+            path,
+            model_state=model_state,
+            optim_state=optim_state,
+            trainer_state={
+                "step": self.step,
+                "tokens": self.tokens,
+                "sequences": self.sequences,
+                "algorithm": self.algorithm.name,
+                "config": asdict(self.cfg),
+                "topology": {
+                    "world_size": dist.world_size(),
+                    "strategy": self.cfg.strategy,
+                    "mixed_precision": self.cfg.mixed_precision,
+                    "cpu_offload": self.cfg.cpu_offload,
+                },
+                "torch": torch.__version__,
+            },
+            rank_state={"rng": checkpoint.rng_state(), "source": self.source.state_dict()},
+            keep_last=self.cfg.keep_last,
+        )
 
-    def load(self, path: str) -> None:
-        """Restore what self.save then continues from
-        the saved step.  Rank 0 reads the files, every rank gets its shard."""
-        model_state, optim_state, step = {}, {}, 0
-        if dist.is_main():
-            model_state = torch.load(os.path.join(path, "model.pt"), map_location="cpu")
-            trainer = torch.load(
-                os.path.join(path, "trainer.pt"), map_location="cpu", weights_only=False
+    def load(self, path: str, *, strict: bool = True) -> None:
+        """Resume from ``path``: one checkpoint, or a ckpt_dir whose ``latest`` picks one."""
+        ck = checkpoint.load(path, strict=strict)
+        saved = ck.trainer
+        if saved["algorithm"] != self.algorithm.name:
+            raise ValueError(
+                f"checkpoint trained {saved['algorithm']!r}, this trainer runs "
+                f"{self.algorithm.name!r}; optimizer state would be meaningless"
             )
-            optim_state, step = trainer["optimizer"], trainer["step"]
-        dist.load_state(self.model, self.optimizer, model_state, optim_state)
-        self.step = int(dist.sum_all(step)[0])
+        changed = {k: (v, asdict(self.cfg).get(k)) for k, v in saved["config"].items()
+                   if asdict(self.cfg).get(k) != v}
+        if changed and dist.is_main():
+            warnings.warn(f"config differs from the checkpoint's: {changed}", stacklevel=2)
+        dist.load_state(self.model, self.optimizer, ck.model, ck.optimizer)
+        self.step, self.tokens, self.sequences = saved["step"], saved["tokens"], saved["sequences"]
+        if "rng" in ck.rank:
+            checkpoint.set_rng_state(ck.rank["rng"])
+        if "source" in ck.rank:
+            self.source.load_state_dict(ck.rank["source"])

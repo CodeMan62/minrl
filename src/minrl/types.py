@@ -72,6 +72,13 @@ class Batch:
 class BatchSource:
     def next_batch(self) -> Batch:
         raise NotImplementedError
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Whatever a resume needs to continue the data stream; nothing by default."""
+        return {}
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        return None
 #Training types
 @dataclass
 class Sequence:
