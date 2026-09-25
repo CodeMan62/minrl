@@ -115,3 +115,8 @@ way; [`docs/entropy.md`](docs/entropy.md) explains why it matters.
 - **Post-train a model on too many gpu's(kinda dumb).**
 - **Env registry**
 
+
+## Acknowledgements
+
+A lot of the code in this repo is inspired by
+[ludic](https://github.com/hallerite/ludic). thanks to @hallerite 
