@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Sequence
+from typing import Any
 
-import requests
 import torch
-from typing import Sequence
-from vllm.distributed.parallel_state import get_world_group
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+from vllm.distributed.parallel_state import get_world_group
 from vllm.distributed.utils import StatelessProcessGroup
+
+DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024
+DEFAULT_PACKED_NUM_BUFFERS = 2
 
 
 class WeightSyncWorkerExtension:
@@ -18,23 +20,36 @@ class WeightSyncWorkerExtension:
         self,
         host: str,
         port: int,
-        world_size: str
+        world_size: int,
+        device: torch.device,
     ) -> None:
         rank = get_world_group().rank
         pg = StatelessProcessGroup.create(
             host=host, port=port, rank=rank, world_size=world_size
         )
-        self._group = PyNcclCommunicator(
-            pg, device=self.device
-        )
-        self.client_rank = world_size - 1
+        self.group = PyNcclCommunicator(pg, device=self.device())
+        self.device = device
+        self.client_rank = 0
 
-    def sync(self, name: str, dtype: str, shape: Sequence[int]) -> None:
-        dtype_x = getattr(torch, dtype.split(".")[-1])
-        weight = torch.empty(shape, dtype=dtype_x, device=self.device)
-        self.group.broadcast(self, weight, src=self.client_rank)
-        self.model_runner.model.load_weights(weight=[(name,weight)])
+    def sync(
+        self,
+        weights: Sequence[tuple[str, str, Sequence[int]]],
+        model: Any,
+    ) -> None:
+        if self.group is None or self.device is None:
+            raise RuntimeError("weight communicator is not initialized")
+        stream = torch.cuda.current_stream(self.device)
+        received: list[tuple[str, torch.Tensor]] = []
+        for name, dtype_name, shape in weights:
+            dtype = getattr(torch, dtype_name.rsplit(".", 1)[-1], None)
+            if dtype is None or not isinstance(dtype, torch.dtype):
+                raise ValueError(f"unknown torch dtype {dtype_name!r}")
+            tensor = torch.empty(tuple(shape), dtype=dtype, device=self.device)
+            self.group.broadcast(tensor, src=self.client_rank, stream=stream)
+            received.append((name, tensor))
+        model.load_weights(received)
+        stream.synchronize()
+
     def close(self) -> None:
-        if self.group is not None:
-            del self.group
-            self.client_rank = None
+        self.group = None
+        self.client_rank = None
