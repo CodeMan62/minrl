@@ -16,7 +16,7 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 
 from enviornments.gsm8k import GSM8K, GSM8K_SYSTEM_PROMPT  # noqa: E402
-from examples.env.gsm8k.train_grpo import evaluate_gsm8k  # noqa: E402
+from examples.gsm8k.train_grpo import evaluate_gsm8k  # noqa: E402
 from minrl.agents.llm_agent import LLMAgent  # noqa: E402
 from minrl.inference.chat_template import HFChatTemplate  # noqa: E402
 from minrl.inference.parser import TextParser  # noqa: E402

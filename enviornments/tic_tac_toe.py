@@ -1,9 +1,11 @@
 import random
+import asyncio
 
 from minrl.envs.singleagent import SingleAgentEnv
 from minrl.types import StepOutPut, Observation, Info, Rollout
 from minrl.agents.agent import BaseAgent
-from minrl.interaction import episode
+from minrl.rollout_engine import RolloutEngine
+from minrl.types import RolloutRequest
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -33,7 +35,7 @@ class TicTacToe(SingleAgentEnv):
     def sys_prompt(self) -> str:
         return f"""You are playing Tic-Tac-Toe.
             You are the agent and the opponent is the opponent. You are playing as {self.agent_role} and the opponent is playing as {self.opponent_role}. You are the first to move."""
-    def env_reset(self, seed: Optional[int] = None) -> Tuple[Observation, Info]:
+    async def env_reset(self, seed: Optional[int] = None) -> Tuple[Observation, Info]:
         if seed is not None:
             random.seed(seed)
         self.board = [None] * 9
@@ -50,7 +52,7 @@ class TicTacToe(SingleAgentEnv):
             "valid_actions": self.empty_cells(),
         }
         return obs, info
-    def env_step(self, action: int) -> StepOutPut:
+    async def env_step(self, action: int) -> StepOutPut:
         """
         we will figure this out
         so action is a integer from 0 to 8
@@ -180,37 +182,4 @@ class TicTacToe(SingleAgentEnv):
     def random_policy(self) -> int:
         """Return a random valid action."""
         return random.choice(self.empty_cells())
-
-
-# a mock agent that returns 1
-class MockAgent(BaseAgent):
-    def act(self, obs: Observation)->int:
-        return 1
-
-# test the rollout function
-if __name__ == "__main__":
-    env = TicTacToe()
-    agent = MockAgent()
-    result = episode(agent, env, 10)
-
-    from pprint import pprint
-
-    print("==== ROLLOUT SUMMARY ====")
-    print(f"Total steps: {result.index}")
-    print(f"Total reward: {result.total_reward}")
-    print(f"Terminated: {result.terminated}")
-    print(f"Truncated: {result.truncated}")
-    print(f"Info: {result.info}")
-
-    print("\n==== STEPS ====")
-    for step in result.steps:
-        print(f"Step {step.index}:")
-        print(f"  Prev Obs:\n{step.prev_obs}")
-        print(f"  Action: {step.action}")
-        print(f"  Next Obs:\n{step.next_obs}")
-        print(f"  Reward: {step.reward}")
-        print(f"  Terminated: {step.terminated}")
-        print(f"  Truncated: {step.truncated}")
-        print(f"  Info: {step.info}")
-        print("-" * 30)
 
