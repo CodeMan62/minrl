@@ -1,8 +1,9 @@
 """GSM8K environment and answer verifier."""
 
 from fractions import Fraction
+from functools import lru_cache
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 from minrl.envs.qa import QAEnv
 
@@ -47,11 +48,26 @@ def parse_final_answer(text: str, expected: Optional[str] = None):
     return float(expected_result is not None and result == expected_result)
 
 
+@lru_cache(maxsize=None)
+def load_pairs(split: str, limit: Optional[int] = None) -> Tuple[Tuple[str, str], ...]:
+    """(question, gold answer) pairs from ``openai/gsm8k``, loaded once per process
+    so building a ``GSM8K`` env for every rollout is just a list copy."""
+    from datasets import load_dataset
+
+    dataset = load_dataset("openai/gsm8k", "main", split=split)
+    pairs = []
+    for example in dataset:
+        question = str(example["question"])
+        answer = str(example["answer"]).rsplit("####", 1)[-1].strip()
+        pairs.append((question, answer))
+    return tuple(pairs[:limit])
+
+
 class GSM8K(QAEnv):
     """The ``openai/gsm8k`` dataset exposed as a one-step QA environment.
 
-    ``repeat=group_size`` makes each consecutive group of resets serve one
-    question, which is required for meaningful group-relative GRPO rewards.
+    ``reset(seed)`` serves question ``seed % len(pairs)``, so the rollouts of one
+    GRPO group, which share a seed, answer the same question.
     """
 
     def __init__(
@@ -59,25 +75,13 @@ class GSM8K(QAEnv):
         split: str = "train",
         *,
         limit: Optional[int] = None,
-        repeat: int = 1,
         shuffle: bool = False,
         seed: int = 0,
     ):
-        from datasets import load_dataset
-
-        dataset = load_dataset("openai/gsm8k", "main", split=split)
-        pairs = []
-        for example in dataset:
-            question = str(example["question"])
-            answer = str(example["answer"]).rsplit("####", 1)[-1].strip()
-            pairs.append((question, answer))
-        if limit is not None:
-            pairs = pairs[:limit]
         super().__init__(
-            pairs,
+            load_pairs(split, limit),
             reward_fn=parse_final_answer,
             system_prompt=GSM8K_SYSTEM_PROMPT,
-            repeat=repeat,
             shuffle=shuffle,
             seed=seed,
         )

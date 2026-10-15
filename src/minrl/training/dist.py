@@ -15,6 +15,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -101,6 +102,10 @@ def mean_all(metrics: Dict[str, float]) -> Dict[str, float]:
 def barrier() -> None:
     if dist.is_initialized():
         dist.barrier()
+
+def full_tensor(p: torch.Tensor) -> torch.Tensor:
+    """The whole parameter; for an FSDP shard this all-gathers, on every rank."""
+    return p.full_tensor() if isinstance(p, DTensor) else p.data
 
 # --------------------------------------------------------------------------
 # checkpoint state: full (unsharded) on rank 0, whatever the wrapping

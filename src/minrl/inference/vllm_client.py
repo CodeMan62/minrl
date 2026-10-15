@@ -1,17 +1,13 @@
 import asyncio
+import time
 import weakref
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import requests
 from openai import AsyncOpenAI
 
 from minrl.inference.client import InferenceClient
 from minrl.types import ChatResponse
-from vllm.distributed.weight_transfer import (
-        HTTPVLLMWeightSyncClient,
-        ModuleSource,
-        WeightTransferTrainerFactory,
-    )
-from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerInitInfo
 
 # vLLM reports each logprob token as this string when the server is started
 # with ``--return-tokens-as-token-ids``; that is how we recover the sampled ids.
@@ -31,10 +27,13 @@ class VLLMClient(InferenceClient):
         uv run vllm_server Qwen/Qwen3-0.6
     """
 
-    def __init__(self, base_url: str, model: str, api_key: str = "local"):
-        self.base_url = base_url
+    def __init__(self, server_url: str, model: str, api_key: str = "local", timeout: float = 300.0):
+        # The bare server URL; a trailing /v1 from older callers is tolerated.
+        self.server_url = server_url.rstrip("/").removesuffix("/v1")
+        self.base_url = f"{self.server_url}/v1"
         self.model = model
         self.api_key = api_key
+        self.timeout = timeout
         # One AsyncOpenAI per event loop: its connection pool is bound to the loop
         # that first used it, and training and eval each run on their own loop.
         self._clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, AsyncOpenAI]" = (
@@ -77,6 +76,49 @@ class VLLMClient(InferenceClient):
             finish_reason=choice.finish_reason,
         )
 
+    # ---- server routes the trainer calls between steps (blocking) ------------
+
+    def _get(self, path: str) -> Dict[str, Any]:
+        r = requests.get(f"{self.server_url}/{path}", timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, path: str, **kwargs) -> Dict[str, Any]:
+        r = requests.post(f"{self.server_url}/{path}", timeout=self.timeout, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
+    def health(self) -> Dict[str, Any]:
+        """Model, dtype, worker world size and weight version, from ``/minrl/health``."""
+        return self._get("minrl/health")
+
+    def wait_ready(self, timeout: float = 600.0, poll: float = 2.0) -> Dict[str, Any]:
+        """Block until the server answers :meth:`health`, or raise."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return self.health()
+            except requests.RequestException as e:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"vLLM server at {self.server_url} not ready after {timeout}s") from e
+                time.sleep(poll)
+
+    def init_weight_sync(self, host: str, port: int, world_size: int) -> None:
+        """Have every worker join the trainer's NCCL group; returns once they all have."""
+        self._post("minrl/init_weight_sync", json={"host": host, "port": port, "world_size": world_size})
+
+    def update_weights(self, weights: Sequence[Tuple[str, str, Sequence[int]]],
+                       version: Optional[str] = None) -> None:
+        """Have the workers receive one broadcast per ``(name, dtype, shape)`` and load them."""
+        self._post("minrl/update_weights", json={"weights": weights, "version": version})
+
+    def pause(self, mode: str = "keep") -> None:
+        """Stop scheduling generation: ``keep`` freezes, ``wait`` drains, ``abort`` drops requests."""
+        self._post("pause", params={"mode": mode})
+
+    def resume(self) -> None:
+        self._post("resume")
+
 
 def _extract_tokens(logprobs) -> Tuple[List[int], List[float]]:
     """Pull ``(token_ids, logprobs)`` out of an OpenAI completion logprobs object."""
@@ -92,18 +134,3 @@ def _extract_tokens(logprobs) -> Tuple[List[int], List[float]]:
         token_ids.append(int(tok[len(_TOKEN_ID_PREFIX):]))
     return token_ids, list(logprobs.token_logprobs)
 
-
-def vllm_weight_synchronizer(model, server_url: str, *, host: str = "127.0.0.1",
-                             port: int = 29501, rank: int = 0):
-    """NCCL weight sync from the trainer into a running ``vllm_server``.
-    The server must be started with ``--weight-transfer-config
-    '{"backend":"nccl"}'``. Trainer rank 0 is the sender (NCCL rank 0, the
-    vLLM worker is rank 1); other FSDP ranks only join the gather of their
-    shards, so every rank calls ``send_weights()`` after each optimizer step.
-    ``model`` may be sharded in place afterwards: parameters are read lazily.
-    """
-    return WeightTransferTrainerFactory.trainer_init(
-        NCCLTrainerInitInfo(master_address=host, master_port=port, world_size=2, rank=rank),
-        client=HTTPVLLMWeightSyncClient(server_url),
-        source=ModuleSource(model),
-    )

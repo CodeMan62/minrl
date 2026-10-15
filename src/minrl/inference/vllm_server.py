@@ -34,7 +34,36 @@ router = APIRouter(prefix="/minrl")
 @router.get("/health")
 async def health(request: Request) -> dict:
     """Liveness plus what is being served, for trainers waiting on startup."""
-    return {"status": "ok", "model": request.app.state.args.model}
+    state = request.app.state
+    return {
+        "status": "ok",
+        "model": state.args.model,
+        "dtype": str(state.vllm_config.model_config.dtype),
+        "world_size": state.vllm_config.parallel_config.world_size,
+        "weight_version": await state.engine_client.get_weight_version(),
+    }
+
+
+@router.post("/init_weight_sync")
+async def init_weight_sync(request: Request) -> dict:
+    """Workers join the trainer's NCCL group; returns once the rendezvous completes."""
+    body = await request.json()
+    await request.app.state.engine_client.collective_rpc(
+        "init_weight_sync",
+        kwargs={"host": body["host"], "port": int(body["port"]), "world_size": int(body["world_size"])},
+    )
+    return {"status": "ok"}
+
+
+@router.post("/update_weights")
+async def update_weights(request: Request) -> dict:
+    """Workers receive one broadcast per parameter from the trainer and load them."""
+    body = await request.json()
+    engine = request.app.state.engine_client
+    await engine.collective_rpc("receive_weights", kwargs={"weights": body["weights"]})
+    if body.get("version") is not None:
+        await engine.update_weight_version(str(body["version"]))
+    return {"status": "ok", "weight_version": await engine.get_weight_version()}
 
 
 def build_serve_argv(model: str, extra: Sequence[str] = ()) -> List[str]:

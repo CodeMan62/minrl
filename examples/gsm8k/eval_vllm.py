@@ -2,7 +2,7 @@
 
 Run before and after ``train_grpo.py`` while the same server stays up::
 
-    python examples/env/gsm8k/eval_vllm.py --samples 200
+    python examples/gsm8k/eval_vllm.py --samples 200
 """
 
 import argparse
@@ -11,16 +11,15 @@ import sys
 
 from transformers import AutoTokenizer
 
-_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..")
-sys.path.insert(0, _ROOT)
-sys.path.insert(0, os.path.join(_ROOT, "src"))
+from minrl.agents.llm_agent import LLMAgent
+from minrl.eval import Eval, EvalConfig
+from minrl.inference.chat_template import HFChatTemplate
+from minrl.inference.parser import TextParser
+from minrl.inference.vllm_client import VLLMClient
 
+# ``enviornments`` lives at the repo root and is not an installed package.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from enviornments.gsm8k import GSM8K, GSM8K_SYSTEM_PROMPT  # noqa: E402
-from examples.gsm8k.train_grpo import evaluate_gsm8k  # noqa: E402
-from minrl.agents.llm_agent import LLMAgent  # noqa: E402
-from minrl.inference.chat_template import HFChatTemplate  # noqa: E402
-from minrl.inference.parser import TextParser  # noqa: E402
-from minrl.inference.vllm_client import VLLMClient  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,26 +31,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", default="test", choices=["train", "test"])
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument("--concurrency", type=int, default=16, help="questions in flight at once")
+    p.add_argument("--dump", default=None, help="dir for per-rollout jsonl dumps")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.samples < 1:
-        raise SystemExit("--samples must be positive")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    agent = LLMAgent(
-        VLLMClient(f"{args.vllm_url.rstrip('/')}/v1", args.model),
-        HFChatTemplate(tokenizer),
-        TextParser(),
-        system_prompt=GSM8K_SYSTEM_PROMPT,
-        max_tokens=args.max_new_tokens,
-        temperature=0.0,
-    )
-    env = GSM8K(split=args.split, limit=args.limit, repeat=1)
+    client = VLLMClient(args.vllm_url, args.model)
+    template = HFChatTemplate(tokenizer)
 
-    score = evaluate_gsm8k(agent, env, args.samples)
-    print(f"accuracy: {score['accuracy']:.1%} ({int(score['correct'])}/{args.samples})")
+    # Greedy decoding; a fresh (agent, env) pair per question since both are stateful.
+    def make():
+        agent = LLMAgent(
+            client, template, TextParser(), system_prompt=GSM8K_SYSTEM_PROMPT,
+            max_tokens=args.max_new_tokens, temperature=0.0,
+        )
+        return agent, GSM8K(split=args.split, limit=args.limit)
+
+    Eval(
+        EvalConfig(model=args.model, num_episodes=args.samples, max_steps=1,
+                   concurrency=args.concurrency, dump_dir=args.dump),
+        make,
+    ).evaluate_sync()
 
 
 if __name__ == "__main__":

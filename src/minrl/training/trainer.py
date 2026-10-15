@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from typing import Dict, Iterator, Optional
 import torch
 import torch.optim as optim
 from torch import nn
+from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+from vllm.distributed.utils import StatelessProcessGroup
+from minrl.inference.vllm_client import VLLMClient
 from minrl.loggers import Logger
 from minrl.training import checkpoint, dist
 from minrl.training.algorithms import Algorithm
@@ -26,15 +30,14 @@ class Trainer:
         config: TrainerConfig,
         logger: Optional[Logger] = None,
         ref_model: Optional[nn.Module] = None,
-        weight_synchronizer=None,
-        sync_every: int = 1,
+        runtime: Optional[VLLMClient] = None,  # where the policy is served; pushed to after each step
     ):
         self.algorithm = algorithm
         self.source = source
         self.cfg = config
         self.logger = logger
-        self.weight_synchronizer = weight_synchronizer
-        self.sync_every = sync_every
+        self.runtime = runtime
+        self._runtime_link: Optional[PyNcclCommunicator] = None  # rank 0's NCCL group, opened on first push
         self.step = 0
         self.tokens = 0  # action tokens trained on so far, across every rank
         self.sequences = 0
@@ -139,8 +142,8 @@ class Trainer:
             stats = self.train_step()
             self.tokens += int(stats["n_tokens"])
             self.sequences += int(stats["n_seqs"])
-            if self.weight_synchronizer is not None and self.step % self.sync_every == 0:
-                self.weight_synchronizer.send_weights()
+            if self.runtime is not None and cfg.sync_every and self.step % cfg.sync_every == 0:
+                self.push_weights_to_runtime()
             if cfg.ckpt_every and self.step % cfg.ckpt_every == 0:
                 self.save()
             stats = {**stats, "step": float(self.step), "tokens": float(self.tokens)}
@@ -151,11 +154,63 @@ class Trainer:
                 )
             yield stats
 
+    # ---- weight sync ----------------------------------------------------
+
+    def push_weights_to_runtime(self) -> None:
+        if self.runtime is None:
+            return
+        params = list(self.model.named_parameters())
+        if not dist.is_main():
+            with torch.no_grad():
+                for _, p in params:
+                    dist.full_tensor(p)
+            return
+
+        if self._runtime_link is None:
+            self._runtime_link = self._open_runtime_link()
+        link, cfg = self._runtime_link, self.cfg
+        meta = [(name, str(p.dtype).removeprefix("torch."), list(p.shape)) for name, p in params]
+        if cfg.sync_pause:
+            self.runtime.pause(cfg.sync_pause)
+        # The workers sit in receive_weights until the last broadcast lands,
+        # so that request runs on a thread while we broadcast. If a broadcast
+        # fails they stay stuck in NCCL, so never join the thread on the way out.
+        exe = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = exe.submit(self.runtime.update_weights, meta, str(self.step))
+            stream = torch.cuda.current_stream(link.device)
+            with torch.no_grad():
+                for _, p in params:
+                    link.broadcast(dist.full_tensor(p).contiguous(), src=0, stream=stream)
+            stream.synchronize()
+            future.result()
+        finally:
+            exe.shutdown(wait=False)
+        if cfg.sync_pause:
+            self.runtime.resume()
+
+    def _open_runtime_link(self) -> PyNcclCommunicator:
+        """Rank 0 forms one NCCL group with the runtime's workers: itself as rank 0, them after."""
+        cfg = self.cfg
+        world_size = 1 + int(self.runtime.wait_ready()["world_size"])
+        device = torch.device("cuda", torch.cuda.current_device())
+        # The workers block inside init_weight_sync until rank 0 joins the
+        # rendezvous, so the request runs on a thread while we join it.
+        with ThreadPoolExecutor(max_workers=1) as exe:
+            future = exe.submit(self.runtime.init_weight_sync, cfg.sync_host, cfg.sync_port, world_size)
+            pg = StatelessProcessGroup.create(
+                host=cfg.sync_host, port=cfg.sync_port, rank=0, world_size=world_size
+            )
+            link = PyNcclCommunicator(pg, device=device)
+            future.result()
+        return link
+
     def close(self) -> None:
-        """Release the batch source; a RolloutSource stops generating and joins its loop."""
+        """Release the batch source and the runtime link."""
         close = getattr(self.source, "close", None)
         if close is not None:
             close()
+        self._runtime_link = None
 
     # ---- checkpointing --------------------------------------------------
 
@@ -204,3 +259,5 @@ class Trainer:
             checkpoint.set_rng_state(ck.rank["rng"])
         if "source" in ck.rank:
             self.source.load_state_dict(ck.rank["source"])
+        # The runtime still holds the base weights; serve the resumed policy.
+        self.push_weights_to_runtime()
