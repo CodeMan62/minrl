@@ -2,16 +2,15 @@
 Start the server on GPU 0 first::
 
     CUDA_VISIBLE_DEVICES=0 vllm_server Qwen/Qwen3-0.6B \\
-        --gpu-memory-utilization 0.7 \\
-        --weight-transfer-config '{"backend":"nccl"}'
+        --gpu-memory-utilization 0.7
 
 Then train on GPU 1::
 
-    CUDA_VISIBLE_DEVICES=1 python examples/env/tic-tac-toe/train_grpo.py
+    CUDA_VISIBLE_DEVICES=1 python examples/tic-tac-toe/train_grpo.py
 
 or on GPUs 1-3 with FSDP2 (one rank per GPU, each playing its own games)::
 
-    CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 examples/env/tic-tac-toe/train_grpo.py
+    CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 examples/tic-tac-toe/train_grpo.py
 """
 
 import argparse
@@ -26,7 +25,7 @@ from minrl.agents.llm_agent import LLMAgent
 from minrl.inference.chat_template import HFChatTemplate
 from minrl.inference.parser import MoveParser
 from minrl.eval import Eval, EvalConfig
-from minrl.inference.vllm_client import VLLMClient, vllm_weight_synchronizer
+from minrl.inference.vllm_client import VLLMClient
 from minrl.loggers import make_logger
 from minrl.training import checkpoint, dist
 from minrl.training.algorithms import grpo
@@ -35,7 +34,7 @@ from minrl.training.sources import RolloutSource
 from minrl.training.trainer import Trainer
 
 # ``enviornments`` lives at the repo root and is not an installed package.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from enviornments import TicTacToe  # noqa: E402
 
 SYSTEM_PROMPT = (
@@ -111,7 +110,7 @@ def main() -> None:
     model.config.use_cache = False
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    client = VLLMClient(f"{args.vllm_url.rstrip('/')}/v1", args.model)
+    client = VLLMClient(args.vllm_url, args.model)
     # enable_thinking=False: Qwen3 answers directly instead of spending the
     # token budget on a <think> block.
     template = HFChatTemplate(tokenizer, template_kwargs={"enable_thinking": False})
@@ -133,10 +132,6 @@ def main() -> None:
 
     make_train, make_eval = make_actor(1.0), make_actor(0.0)
 
-    synchronizer = vllm_weight_synchronizer(
-        model, args.vllm_url, host=args.weight_transfer_host, port=args.weight_transfer_port,
-        rank=rank,
-    )
     logger = make_logger(args) if main else None
     trainer = Trainer(
         model,
@@ -156,9 +151,11 @@ def main() -> None:
             ckpt_dir=args.ckpt_dir,
             ckpt_every=args.ckpt_every,
             keep_last=args.keep_last,
+            sync_host=args.weight_transfer_host,
+            sync_port=args.weight_transfer_port,
         ),
         logger=logger,
-        weight_synchronizer=synchronizer,
+        runtime=client,  # after every step the new weights are pushed into vLLM
     )
 
     if args.resume == "auto":
@@ -189,8 +186,7 @@ def main() -> None:
             evals.append(evaluator.evaluate_sync(step=step))
 
     trainer.save(os.path.join(args.ckpt_dir, "final"))
-    trainer.close()  # stop the rollout engine before tearing down weight transfer
-    synchronizer.shutdown()
+    trainer.close()  # stops the rollout engine and drops the NCCL link to vLLM
     if main:
         evals.append(evaluator.evaluate_sync(step=trainer.step))
         baseline, final = evals[0], evals[-1]

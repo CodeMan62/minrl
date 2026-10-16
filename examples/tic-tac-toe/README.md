@@ -12,19 +12,18 @@ server over NCCL, which is why both must share a host.
 ## Train
 Run vllm server in terminal 1:-
 ```bash
-CUDA_VISIBLE_DEVICES=0 vllm_server Qwen/Qwen3-0.6B \
-    --gpu-memory-utilization 0.7 --weight-transfer-config '{"backend":"nccl"}'
+CUDA_VISIBLE_DEVICES=0 vllm_server Qwen/Qwen3-0.6B --gpu-memory-utilization 0.7
 ```
 Run training on terminal 2:-
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python examples/env/tic-tac-toe/train_grpo.py
+CUDA_VISIBLE_DEVICES=1 python examples/tic-tac-toe/train_grpo.py
 ```
 
 Or on GPUs 1-3 with FSDP2, one rank per GPU:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 examples/env/tic-tac-toe/train_grpo.py
+CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node=3 examples/tic-tac-toe/train_grpo.py
 ```
 
 Defaults: 150 steps, 8 games per GRPO group, lr 5e-6, a checkpoint every
@@ -59,7 +58,7 @@ costs at most one finished step.
 
 ```bash
 pip install wandb && wandb login
-python examples/env/tic-tac-toe/train_grpo.py --wandb
+python examples/tic-tac-toe/train_grpo.py --wandb
 ```
 
 Logging is off by default; `--wandb` turns it on, and the run URL is printed
