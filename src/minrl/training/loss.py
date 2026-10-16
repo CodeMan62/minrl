@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence as Seq, Tuple
+from typing import Dict, List, Optional, Sequence as Seq, Tuple, Any
 
 import torch
 import torch.nn.functional as F
@@ -72,6 +72,20 @@ def entropy(logits: torch.Tensor) -> torch.Tensor:
     logits = logits.float()
     return logits.logsumexp(-1) - (logits.softmax(-1) * logits).sum(-1)
 
+def tis_function(
+    surrogate, logp: torch.Tensor, old_logp: torch.Tensor, *, low: float = 0.5, high: float = 2.0
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    tis = torch.exp(logp - old_logp)
+    tis_weights = tis.clamp(min=low, max=high).detach()
+    tis_frac = (tis_weights != tis).float()
+    tis_mean =(tis - 1).abs() 
+    metrices =  {
+        "tis": tis.clone().detach(),
+        "tis_frac": tis_frac.clone().detach(),
+        "tis_mean": tis_mean.clone().detach()
+    }
+    return metrices, tis_weights
+
 
 def reduce(
     per_token: torch.Tensor,
@@ -121,13 +135,15 @@ def clipped_surrogate(
     kl_coef: float = 0.0,
     ent_coef: float = 0.0,
     max_tokens: Optional[int] = None,
+    tis: bool = False,
     **_,
 ) -> Tuple[torch.Tensor, Aux]:
     """PPO's clipped objective, shared by GRPO and Dr. GRPO::
 
         rho_t = pi_theta(o_t) / pi_old(o_t)
-        L = -E_t[ min(rho_t * A, clip(rho_t, 1-eps, 1+eps) * A)
+        L = -E_t[ w_t * min(rho_t * A, clip(rho_t, 1-eps, 1+eps) * A)
                   - beta * KL(pi_theta || pi_ref) + alpha * H ]
+        w_t is tis weights. 
     """
     p, logits, logp = logprobs(model, seqs)
     ratio = torch.exp(logp - p.old_logp)
@@ -135,6 +151,10 @@ def clipped_surrogate(
     surrogate = torch.minimum(ratio * a, ratio.clamp(1 - clip_eps, 1 + clip_eps) * a)
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, clip_eps, clip_eps)}
+    if tis:
+        metrices, weight = tis_function(surrogate, logp, p.old_logp)
+        surrogate = surrogate * weight
+        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
     if kl_coef:
         if ref_model is None:
@@ -159,12 +179,13 @@ def cispo_surrogate(
     eps_low: float,
     eps_high: float,
     ent_coef: float = 0.0,
+    tis: bool = False,
     **_,
 ) -> Tuple[torch.Tensor, Aux]:
     """CISPO's clipped importance-weight objective::
 
         rho_t = pi_theta(o_t) / pi_old(o_t)
-        L = -E_t[ sg(clip(rho_t, 1-eps_low, 1+eps_high)) * A * log pi_theta(o_t) ]
+        L = -E_t[ w_t * sg(clip(rho_t, 1-eps_low, 1+eps_high)) * A * log pi_theta(o_t) ]
 
     The weight is clipped *and detached* -- a coefficient, never a path for
     gradients.  That is the whole idea: where PPO's clip deletes the gradient of
@@ -176,20 +197,29 @@ def cispo_surrogate(
     surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv * logp
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, eps_low, eps_high)}
+    if tis:
+        metrices, weight = tis_function(surrogate, logp, p.old_logp)
+        surrogate = surrogate * weight
+        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
     return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
 
 
 def score_function(
     model, seqs: Seq[Sequence], *, agg: str, n_seqs: float, n_tokens: float,
-    ent_coef: float = 0.0, **_
+    ent_coef: float = 0.0, tis: bool = False, **_
 ) -> Tuple[torch.Tensor, Aux]:
     """REINFORCE's score-function estimator::
-        L = -E_t[ A_t * log pi_theta(a_t | s_t) + alpha * H ]
+        L = -E_t[ w_t * A_t * log pi_theta(a_t | s_t) + alpha * H ]
     """
     p, logits, logp = logprobs(model, seqs)
     aux: Aux = {}
-    surrogate = _add_entropy(p.adv * logp, logits, p.mask, n_tokens, ent_coef, aux)
+    surrogate = p.adv * logp
+    if tis:
+        metrices, weight = tis_function(surrogate, logp, p.old_logp)
+        surrogate = surrogate * weight
+        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
+    surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
     return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
 
 

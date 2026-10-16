@@ -29,21 +29,23 @@ def grpo(
     kl_coef: float = 0.0,
     ent_coef: float = 0.0,
     group_size: Optional[int] = None,
+    tis: bool = False,
 ) -> Algorithm:
     """Group Relative Policy Optimization (DeepSeekMath, arXiv:2402.03300)::
 
         J = E[ 1/G sum_i  1/|o_i| sum_t
-               min(rho * A_i, clip(rho, 1-eps, 1+eps) * A_i) - beta * KL ]
+               w_t * min(rho * A_i, clip(rho, 1-eps, 1+eps) * A_i) - beta * KL ]
 
     with ``A_i = (R_i - mean_group R) / std_group R``, and ``rho`` each token's
-    importance ratio against the policy that sampled it.
+    importance ratio against the policy that sampled it. ``tis`` enables the
+    truncated importance-sampling weight ``w_t``.
     """
     return Algorithm(
         name="grpo",
         estimator=partial(estim.group_relative, group_size=group_size),
         loss=partial(
             loss.clipped_surrogate, agg="seq-mean",
-            clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef,
+            clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef, tis=tis,
         ),
     )
 
@@ -55,6 +57,7 @@ def dr_grpo(
     kl_coef: float = 0.0,
     ent_coef: float = 0.0,
     group_size: Optional[int] = None,
+    tis: bool = False,
 ) -> Algorithm:
     """Dr. GRPO (arXiv:2503.20783).
     """
@@ -63,7 +66,7 @@ def dr_grpo(
         estimator=partial(estim.group_relative, group_size=group_size, std=False),
         loss=partial(
             loss.clipped_surrogate, agg="budget", max_tokens=max_tokens,
-            clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef,
+            clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef, tis=tis,
         ),
     )
 
@@ -74,29 +77,32 @@ def cispo(
     eps_high: float = 4.0,
     ent_coef: float = 0.0,
     group_size: Optional[int] = None,
+    tis: bool = False,
 ) -> Algorithm:
     """Clipped IS-weight Policy Optimization (MiniMax-M1, arXiv:2506.13585)::
         J = E[ 1/sum_i|o_i| sum_i sum_t
-               sg(clip(rho, 1-eps_low, 1+eps_high)) * A_i * log pi(o_it) ]
+               w_t * sg(clip(rho, 1-eps_low, 1+eps_high)) * A_i * log pi(o_it) ]
     """
     return Algorithm(
         name="cispo",
         estimator=partial(estim.group_relative, group_size=group_size),
         loss=partial(
             loss.cispo_surrogate, agg="token-mean",
-            eps_low=eps_low, eps_high=eps_high, ent_coef=ent_coef,
+            eps_low=eps_low, eps_high=eps_high, ent_coef=ent_coef, tis=tis,
         ),
     )
 
 
-def reinforce(*, gamma: float = 1.0, baseline: bool = True, ent_coef: float = 0.0) -> Algorithm:
+def reinforce(
+    *, gamma: float = 1.0, baseline: bool = True, ent_coef: float = 0.0, tis: bool = False
+) -> Algorithm:
     """Vanilla policy gradient with a Monte-Carlo return estimate::
-        grad J = 1/N sum_i sum_t (G_t - b) grad log pi(a_t | s_t)
+        grad J = 1/N sum_i sum_t w_t * (G_t - b) grad log pi(a_t | s_t)
     """
     return Algorithm(
         name="reinforce",
         estimator=partial(estim.monte_carlo, gamma=gamma, baseline=baseline),
-        loss=partial(loss.score_function, agg="seq-sum", ent_coef=ent_coef),
+        loss=partial(loss.score_function, agg="seq-sum", ent_coef=ent_coef, tis=tis),
     )
 
 
