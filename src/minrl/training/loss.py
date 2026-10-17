@@ -56,13 +56,6 @@ def forward(model, p: Packed) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def logprobs(model, seqs: Seq[Sequence]) -> Tuple[Packed, torch.Tensor, torch.Tensor]:
-    """Pack and run ``seqs`` -> ``(packed, logits, per-token logprobs)``."""
-    p = pack(seqs, device_of(model))
-    logits, logp = forward(model, p)
-    return p, logits, logp
-
-
 def entropy(logits: torch.Tensor) -> torch.Tensor:
     """Per-token entropy of the policy, in nats: ``logsumexp(z) - sum_v p_v z_v``.
 
@@ -73,7 +66,7 @@ def entropy(logits: torch.Tensor) -> torch.Tensor:
     return logits.logsumexp(-1) - (logits.softmax(-1) * logits).sum(-1)
 
 def tis_function(
-    surrogate, logp: torch.Tensor, old_logp: torch.Tensor, *, low: float = 0.5, high: float = 2.0
+    logp: torch.Tensor, old_logp: torch.Tensor, *, low: float = 0.5, high: float = 2.0
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     tis = torch.exp(logp - old_logp)
     tis_weights = tis.clamp(min=low, max=high).detach()
@@ -145,14 +138,15 @@ def clipped_surrogate(
                   - beta * KL(pi_theta || pi_ref) + alpha * H ]
         w_t is tis weights. 
     """
-    p, logits, logp = logprobs(model, seqs)
+    p = pack(seqs, next(model.parameters()).device)
+    logits, logp = forward(model, p)
     ratio = torch.exp(logp - p.old_logp)
     a = p.adv
     surrogate = torch.minimum(ratio * a, ratio.clamp(1 - clip_eps, 1 + clip_eps) * a)
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, clip_eps, clip_eps)}
     if tis:
-        metrices, weight = tis_function(surrogate, logp, p.old_logp)
+        metrices, weight = tis_function(logp, p.old_logp)
         surrogate = surrogate * weight
         aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
@@ -192,13 +186,14 @@ def cispo_surrogate(
     any token that strays out of the trust region, CISPO keeps every token's
     gradient and only bounds how loudly it speaks.
     """
-    p, logits, logp = logprobs(model, seqs)
+    p = pack(seqs, next(model.parameters()).device)
+    logits, logp = forward(model, p)
     ratio = torch.exp(logp - p.old_logp)
     surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv * logp
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, eps_low, eps_high)}
     if tis:
-        metrices, weight = tis_function(surrogate, logp, p.old_logp)
+        metrices, weight = tis_function(logp, p.old_logp)
         surrogate = surrogate * weight
         aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
@@ -212,11 +207,12 @@ def score_function(
     """REINFORCE's score-function estimator::
         L = -E_t[ w_t * A_t * log pi_theta(a_t | s_t) + alpha * H ]
     """
-    p, logits, logp = logprobs(model, seqs)
+    p = pack(seqs, next(model.parameters()).device)
+    logits, logp = forward(model, p)
     aux: Aux = {}
     surrogate = p.adv * logp
     if tis:
-        metrices, weight = tis_function(surrogate, logp, p.old_logp)
+        metrices, weight = tis_function(logp, p.old_logp)
         surrogate = surrogate * weight
         aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
@@ -229,7 +225,7 @@ def cross_entropy(
     """SFT's masked cross-entropy -- maximize the demonstration's own tokens::
         L = -E_t[ log pi_theta(o_t | o_<t) ]
     """
-    p = pack(seqs, device_of(model))
+    p = pack(seqs, next(model.parameters()).device)
     logits, logp = forward(model, p)
 
     with torch.no_grad():
@@ -257,13 +253,15 @@ def preference(
     """
     if ref_model is None:
         raise ValueError("dpo needs ref_model=<the checkpoint the policy started from>")
-    device = device_of(model)
+    device = next(model.parameters()).device
     chosen = pack([c for c, _ in pairs], device)
     rejected = pack([r for _, r in pairs], device)
 
-    policy = _seq_logp(model, chosen) - _seq_logp(model, rejected)
+    policy = (forward(model, chosen)[1] * chosen.mask).sum(dim=1) \
+        - (forward(model, rejected)[1] * rejected.mask).sum(dim=1)
     with torch.no_grad():
-        reference = _seq_logp(ref_model, chosen) - _seq_logp(ref_model, rejected)
+        reference = (forward(ref_model, chosen)[1] * chosen.mask).sum(dim=1) \
+            - (forward(ref_model, rejected)[1] * rejected.mask).sum(dim=1)
 
     logits = beta * (policy - reference)
     # Sum over the step-wide pair count, not mean, so micro-batching stays exact.
@@ -275,11 +273,6 @@ def preference(
             "margin": logits.sum().item() / n_seqs,
         }
     return loss, aux
-
-
-def device_of(model) -> torch.device:
-    """The device ``model``'s parameters live on."""
-    return next(model.parameters()).device
 
 
 def _add_entropy(
@@ -294,11 +287,6 @@ def _add_entropy(
         ent = entropy(logits)
     aux["entropy"] = _masked_mean(ent, mask, n_tokens)
     return surrogate + ent_coef * ent if ent_coef else surrogate
-
-
-def _seq_logp(model, p: Packed) -> torch.Tensor:
-    """Summed logprob of each sequence's action tokens. ``[B]``"""
-    return (forward(model, p)[1] * p.mask).sum(dim=1)
 
 
 def _kl_k3(logp: torch.Tensor, ref_logp: torch.Tensor) -> torch.Tensor:
