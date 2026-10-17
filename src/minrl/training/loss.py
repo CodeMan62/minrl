@@ -66,16 +66,16 @@ def entropy(logits: torch.Tensor) -> torch.Tensor:
     return logits.logsumexp(-1) - (logits.softmax(-1) * logits).sum(-1)
 
 def tis_function(
-    logp: torch.Tensor, old_logp: torch.Tensor, *, low: float = 0.5, high: float = 2.0
+    logp: torch.Tensor, old_logp: torch.Tensor, *, high: float = 2.0
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     tis = torch.exp(logp - old_logp)
-    tis_weights = tis.clamp(min=low, max=high).detach()
-    tis_frac = (tis_weights != tis).float()
-    tis_mean =(tis - 1).abs() 
-    metrices =  {
-        "tis": tis.clone().detach(),
-        "tis_frac": tis_frac.clone().detach(),
-        "tis_mean": tis_mean.clone().detach()
+    tis_weights = tis.clamp(max=high).detach()
+    tis_frac = (tis > high).float()
+    tis_mean =(tis - 1).abs()
+    metrices = {
+        "tis": tis.detach(),
+        "tis_frac": tis_frac.detach(),
+        "tis_mean": tis_mean.detach(),
     }
     return metrices, tis_weights
 
@@ -136,11 +136,14 @@ def clipped_surrogate(
         rho_t = pi_theta(o_t) / pi_old(o_t)
         L = -E_t[ w_t * min(rho_t * A, clip(rho_t, 1-eps, 1+eps) * A)
                   - beta * KL(pi_theta || pi_ref) + alpha * H ]
-        w_t is tis weights. 
+
+    Without ``tis`` ``w_t`` is one and ``pi_old`` is the rollout engine.  With it
+    ``pi_old`` is the policy this step started from and ``w_t`` is the truncated
+    ``min(pi_old / pi_rollout, C)``, so the sampler mismatch is corrected once.
     """
     p = pack(seqs, next(model.parameters()).device)
     logits, logp = forward(model, p)
-    ratio = torch.exp(logp - p.old_logp)
+    ratio = torch.exp(logp - logp.detach()) if tis else torch.exp(logp - p.old_logp)
     a = p.adv
     surrogate = torch.minimum(ratio * a, ratio.clamp(1 - clip_eps, 1 + clip_eps) * a)
 
@@ -188,7 +191,7 @@ def cispo_surrogate(
     """
     p = pack(seqs, next(model.parameters()).device)
     logits, logp = forward(model, p)
-    ratio = torch.exp(logp - p.old_logp)
+    ratio = torch.exp(logp - logp.detach()) if tis else torch.exp(logp - p.old_logp)
     surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv * logp
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, eps_low, eps_high)}
