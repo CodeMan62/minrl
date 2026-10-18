@@ -30,6 +30,7 @@ def grpo(
     ent_coef: float = 0.0,
     group_size: Optional[int] = None,
     tis: bool = False,
+    icepop: bool = False,
 ) -> Algorithm:
     """Group Relative Policy Optimization (DeepSeekMath, arXiv:2402.03300)::
 
@@ -46,6 +47,7 @@ def grpo(
         loss=partial(
             loss.clipped_surrogate, agg="seq-mean",
             clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef, tis=tis,
+            icepop=icepop,
         ),
     )
 
@@ -58,6 +60,7 @@ def dr_grpo(
     ent_coef: float = 0.0,
     group_size: Optional[int] = None,
     tis: bool = False,
+    icepop: bool = False,
 ) -> Algorithm:
     """Dr. GRPO (arXiv:2503.20783).
     """
@@ -67,6 +70,7 @@ def dr_grpo(
         loss=partial(
             loss.clipped_surrogate, agg="budget", max_tokens=max_tokens,
             clip_eps=clip_eps, kl_coef=kl_coef, ent_coef=ent_coef, tis=tis,
+            icepop=icepop,
         ),
     )
 
@@ -78,6 +82,7 @@ def cispo(
     ent_coef: float = 0.0,
     group_size: Optional[int] = None,
     tis: bool = False,
+    icepop: bool = False,
 ) -> Algorithm:
     """Clipped IS-weight Policy Optimization (MiniMax-M1, arXiv:2506.13585)::
         J = E[ 1/sum_i|o_i| sum_i sum_t
@@ -89,12 +94,14 @@ def cispo(
         loss=partial(
             loss.cispo_surrogate, agg="token-mean",
             eps_low=eps_low, eps_high=eps_high, ent_coef=ent_coef, tis=tis,
+            icepop=icepop,
         ),
     )
 
 
 def reinforce(
-    *, gamma: float = 1.0, baseline: bool = True, ent_coef: float = 0.0, tis: bool = False
+    *, gamma: float = 1.0, baseline: bool = True, ent_coef: float = 0.0,
+    tis: bool = False, icepop: bool = False,
 ) -> Algorithm:
     """Vanilla policy gradient with a Monte-Carlo return estimate::
         grad J = 1/N sum_i sum_t w_t * (G_t - b) grad log pi(a_t | s_t)
@@ -102,7 +109,10 @@ def reinforce(
     return Algorithm(
         name="reinforce",
         estimator=partial(estim.monte_carlo, gamma=gamma, baseline=baseline),
-        loss=partial(loss.score_function, agg="seq-sum", ent_coef=ent_coef, tis=tis),
+        loss=partial(
+            loss.score_function, agg="seq-sum", ent_coef=ent_coef, tis=tis,
+            icepop=icepop,
+        ),
     )
 
 

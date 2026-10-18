@@ -79,6 +79,26 @@ def tis_function(
     }
     return metrices, tis_weights
 
+def icepop_function(
+    logp: torch.Tensor, old_logp: torch.Tensor, *, low: float = 0.5, high: float = 5.0
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """IcePop's double-sided rejection mask on the trainer/rollout ratio.
+
+    Tokens whose ratio ``exp(logp - old_logp)`` leaves ``[low, high]`` are zeroed
+    outright -- unlike TIS, which keeps them at a capped weight. The mask is a
+    detached coefficient, never a path for gradients.
+    """
+    ice = torch.exp(logp - old_logp)
+    keep = (ice >= low) & (ice <= high)
+    ice_weights = torch.where(keep, ice, 0.0).detach()
+    ice_frac = (~keep).float()
+    ice_mean = (ice - 1).abs()
+    metrices = {
+        "icepop": ice.detach(),
+        "icepop_frac": ice_frac.detach(),
+        "icepop_mean": ice_mean.detach(),
+    }
+    return metrices, ice_weights
 
 def reduce(
     per_token: torch.Tensor,
@@ -129,6 +149,7 @@ def clipped_surrogate(
     ent_coef: float = 0.0,
     max_tokens: Optional[int] = None,
     tis: bool = False,
+    icepop: bool = False,
     **_,
 ) -> Tuple[torch.Tensor, Aux]:
     """PPO's clipped objective, shared by GRPO and Dr. GRPO::
@@ -143,13 +164,17 @@ def clipped_surrogate(
     """
     p = pack(seqs, next(model.parameters()).device)
     logits, logp = forward(model, p)
-    ratio = torch.exp(logp - logp.detach()) if tis else torch.exp(logp - p.old_logp)
+    ratio = torch.exp(logp - logp.detach()) if (tis or icepop) else torch.exp(logp - p.old_logp)
     a = p.adv
     surrogate = torch.minimum(ratio * a, ratio.clamp(1 - clip_eps, 1 + clip_eps) * a)
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, clip_eps, clip_eps)}
     if tis:
         metrices, weight = tis_function(logp, p.old_logp)
+        surrogate = surrogate * weight
+        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
+    if icepop:
+        metrices, weight = icepop_function(logp, p.old_logp)
         surrogate = surrogate * weight
         aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
@@ -177,6 +202,7 @@ def cispo_surrogate(
     eps_high: float,
     ent_coef: float = 0.0,
     tis: bool = False,
+    icepop: bool = False,
     **_,
 ) -> Tuple[torch.Tensor, Aux]:
     """CISPO's clipped importance-weight objective::
@@ -191,12 +217,16 @@ def cispo_surrogate(
     """
     p = pack(seqs, next(model.parameters()).device)
     logits, logp = forward(model, p)
-    ratio = torch.exp(logp - logp.detach()) if tis else torch.exp(logp - p.old_logp)
+    ratio = torch.exp(logp - logp.detach()) if (tis or icepop) else torch.exp(logp - p.old_logp)
     surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv * logp
 
     aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, eps_low, eps_high)}
     if tis:
         metrices, weight = tis_function(logp, p.old_logp)
+        surrogate = surrogate * weight
+        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
+    if icepop:
+        metrices, weight = icepop_function(logp, p.old_logp)
         surrogate = surrogate * weight
         aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
@@ -205,7 +235,7 @@ def cispo_surrogate(
 
 def score_function(
     model, seqs: Seq[Sequence], *, agg: str, n_seqs: float, n_tokens: float,
-    ent_coef: float = 0.0, tis: bool = False, **_
+    ent_coef: float = 0.0, tis: bool = False, icepop: bool = False, **_
 ) -> Tuple[torch.Tensor, Aux]:
     """REINFORCE's score-function estimator::
         L = -E_t[ w_t * A_t * log pi_theta(a_t | s_t) + alpha * H ]
@@ -216,6 +246,10 @@ def score_function(
     surrogate = p.adv * logp
     if tis:
         metrices, weight = tis_function(logp, p.old_logp)
+        surrogate = surrogate * weight
+        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
+    if icepop:
+        metrices, weight = icepop_function(logp, p.old_logp)
         surrogate = surrogate * weight
         aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
     surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
