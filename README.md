@@ -75,18 +75,36 @@ src/minrl/      the library; the rollout engine and shared types sit at its top 
   inference/    the vLLM server and client, chat templates, and weight sync
   training/     the trainer, algorithms, losses, data sources, checkpoints, FSDP2
   eval/         evaluation on a fixed set of episodes
-enviornments/   the environments the examples train on: GSM8K and tic-tac-toe
-examples/       runnable training and eval scripts, one folder per environment
+enviornments/   the environments the examples train on, and the ENVS registry train.py picks from
+train.py        the one training entry point; every example is this plus a shell script
+examples/       one folder per example, each with a self-contained run.sh
 docs/           longer notes, starting with entropy in RL
 tests/          the test suite, which runs on CPU in about a minute
 ```
+
+## Running
+
+One Python file, `train.py`, and one shell script per example that sets the
+flags in named arrays, starts the vLLM server on the rollout GPU, waits for
+it, and runs `train.py` on the training GPU(s):
+
+```bash
+examples/dapo-math/run.sh                 # GPU 0 rollouts, GPU 1 trains
+examples/dapo-math/run.sh --eval-only     # score whatever vLLM serves
+TRAIN_GPUS=1,2,3 examples/gsm8k/run.sh    # FSDP2 on three training GPUs
+```
+
+Flags appended to a script override its arrays. `examples/README.md` has the
+scripts' environment variables, the knobs that matter, and how to add an
+example or an environment.
 
 ## Examples
 
 | Example | Status | What it teaches |
 |---|---|---|
-| **GSM8K** | ready | GRPO on grade-school math: one answer per episode, scored by an exact-match check. `examples/env/gsm8k/` |
-| **Tic-tac-toe** | ready | GRPO against a random opponent, either one prompt per move or the whole game as one multi-turn sequence. `examples/env/tic-tac-toe/` |
+| **DAPO-Math-17k** | ready | GRPO with truncated importance sampling on competition math, Qwen3.5-0.8B thinking, eval on MATH-500. Fully async on two GPUs. `examples/dapo-math/run.sh` |
+| **GSM8K** | ready | GRPO on grade-school math: one answer per episode, scored by an exact-match check. `examples/gsm8k/run.sh` |
+| **Tic-tac-toe** | ready | GRPO against a random opponent, either one prompt per move or the whole game as one multi-turn sequence. `examples/tic-tac-toe/run.sh` |
 | **Wordle** | in progress | Multi-turn with a reward at every step, and whether episode-level credit is too coarse for it. |
 | **Alignment tool env** | in progress | A model answers requests using a policy-lookup tool and is scored by a judge: tool calls, a reward that isn't a simple rule, and reward hacking in one env. |
 | **Multi-agent** | in progress | Self-play, where one episode produces a rollout per player. Tic-tac-toe first. |
@@ -113,7 +131,6 @@ way; [`docs/entropy.md`](docs/entropy.md) explains why it matters.
 - **Tinker API integration.** Run minrl's algorithms on Tinker's hosted
   training API as well as on local GPUs.
 - **Post-train a model on too many gpu's(kinda dumb).**
-- **Env registry**
 
 
 ## Acknowledgements
