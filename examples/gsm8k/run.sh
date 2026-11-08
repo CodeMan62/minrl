@@ -35,11 +35,11 @@ MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
 
 MODEL_ARGS=(
     --model "$MODEL"
-    --dtype bf16
+    --dtype fp16
 )
 
 VLLM_ARGS=(
-    --dtype bfloat16
+    --dtype float16
     --max-model-len 4096
     --gpu-memory-utilization 0.7
     --logprobs-mode processed_logprobs

@@ -20,7 +20,7 @@ from fastapi import APIRouter, Request
 from vllm.entrypoints.launchers.api_server.app_state import init_app_state
 from vllm.entrypoints.launchers.api_server.entry import build_async_engine_client
 from vllm.entrypoints.launchers.app import build_app
-from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.launchers.launcher import serve_http, setup_server
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
