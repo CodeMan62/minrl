@@ -31,7 +31,7 @@ overrides them. Each script reads a few environment variables:
 | `VLLM_PORT` | `8000` | server port (`VLLM_HOST` is `127.0.0.1`) |
 | `WEIGHT_SYNC_PORT` | `29501` | NCCL rendezvous the trainer opens for the server's workers |
 | `SKIP_SERVER` | unset | set to anything to attach to a server already running |
-| `PYTHON` | `python` | interpreter, e.g. `"uv run python"` |
+| `PYTHON` | `uv run python` | command that runs the interpreter; falls back to `python` when `uv` is unavailable, override with e.g. `PYTHON=.venv/bin/python` |
 | `LOG_DIR` | `logs/<example>` | `vllm_server.log`, `train.log` and eval dumps land here |
 
 Both GPUs must share a host: the weights go from trainer to server over NCCL.

@@ -14,11 +14,18 @@
 # Environment knobs:
 #   ROLLOUT_GPU=0  TRAIN_GPUS=1 ("1,2,3" = torchrun + FSDP2)  VLLM_PORT=8000
 #   WEIGHT_SYNC_PORT=29501  SKIP_SERVER=1 (attach to a running server)
-#   PYTHON=python  LOG_DIR=logs/dapo-math
+#   PYTHON="uv run python"  LOG_DIR=logs/dapo-math
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-PYTHON=${PYTHON:-python}
+# Use the uv-managed project environment by default; PYTHON overrides it.
+if [[ -n "${PYTHON:-}" ]]; then
+    PYTHON_CMD=($PYTHON)
+elif [[ -f uv.lock ]] && command -v uv >/dev/null 2>&1; then
+    PYTHON_CMD=(uv run python)
+else
+    PYTHON_CMD=(python)
+fi
 LOG_DIR=${LOG_DIR:-logs/dapo-math}
 ROLLOUT_GPU=${ROLLOUT_GPU:-0}
 TRAIN_GPUS=${TRAIN_GPUS:-1}
@@ -134,7 +141,7 @@ stop_server() {
 }
 if [[ -z "${SKIP_SERVER:-}" ]]; then
     echo "starting vLLM on GPU $ROLLOUT_GPU, log: $LOG_DIR/vllm_server.log"
-    CUDA_VISIBLE_DEVICES=$ROLLOUT_GPU $PYTHON -m minrl.inference.vllm_server "$MODEL" "${VLLM_ARGS[@]}" \
+    CUDA_VISIBLE_DEVICES=$ROLLOUT_GPU "${PYTHON_CMD[@]}" -m minrl.inference.vllm_server "$MODEL" "${VLLM_ARGS[@]}" \
         --host "$VLLM_HOST" --port "$VLLM_PORT" >"$LOG_DIR/vllm_server.log" 2>&1 &
     SERVER_PID=$!
     trap stop_server EXIT INT TERM
@@ -154,9 +161,9 @@ done
 echo "vLLM ready: $(curl -s "$HEALTH")"
 
 NGPU=$(tr ',' '\n' <<<"$TRAIN_GPUS" | grep -c .)
-LAUNCHER=("$PYTHON")
+LAUNCHER=("${PYTHON_CMD[@]}")
 if (( NGPU > 1 )); then
-    LAUNCHER=(torchrun --standalone --nproc_per_node="$NGPU")
+    LAUNCHER=("${PYTHON_CMD[@]}" -m torch.distributed.run --standalone --nproc_per_node="$NGPU")
 fi
 echo "training on GPU(s) $TRAIN_GPUS, log: $LOG_DIR/train.log"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS "${LAUNCHER[@]}" train.py \
