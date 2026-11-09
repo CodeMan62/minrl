@@ -26,6 +26,10 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 _TOKEN_ID_FLAG = "--return-tokens-as-token-ids"
 _NO_TOKEN_ID_FLAG = "--no-return-tokens-as-token-ids"
+# vLLM's default ("auto") applies the checkpoint's generation_config.json as
+# default sampling params -- Qwen2.5 ships repetition_penalty=1.1, top_k=20 --
+# so rollouts would come from a different policy than the one being trained.
+_GEN_CONFIG_FLAG = "--generation-config"
 
 # minrl's own endpoints live under /minrl;
 router = APIRouter(prefix="/minrl")
@@ -67,11 +71,13 @@ async def update_weights(request: Request) -> dict:
 
 
 def build_serve_argv(model: str, extra: Sequence[str] = ()) -> List[str]:
-    """Build the ``vllm serve`` argv, injecting minrl's required flag."""
+    """Build the ``vllm serve`` argv, injecting minrl's required flags."""
     extra = list(extra)
     argv = ["vllm", "serve", model]
     if _TOKEN_ID_FLAG not in extra and _NO_TOKEN_ID_FLAG not in extra:
         argv.append(_TOKEN_ID_FLAG)
+    if not any(a == _GEN_CONFIG_FLAG or a.startswith(_GEN_CONFIG_FLAG + "=") for a in extra):
+        argv += [_GEN_CONFIG_FLAG, "vllm"]
     argv.extend(extra)
     return argv
 

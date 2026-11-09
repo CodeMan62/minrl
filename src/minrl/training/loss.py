@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence as Seq, Tuple, Any
+from typing import Dict, List, Optional, Sequence as Seq, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -56,28 +56,36 @@ def forward(model, p: Packed) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def entropy(logits: torch.Tensor) -> torch.Tensor:
+def entropy(logits: torch.Tensor, chunk: int = 256) -> torch.Tensor:
     """Per-token entropy of the policy, in nats: ``logsumexp(z) - sum_v p_v z_v``.
 
     How undecided the policy is over the whole vocabulary at each position,
     unlike ``logp``, which only scores the one token that was sampled.
+    Computed ``chunk`` positions at a time so the [B, T, V] softmax
+    temporaries never exist all at once.
     """
-    logits = logits.float()
-    return logits.logsumexp(-1) - (logits.softmax(-1) * logits).sum(-1)
+    out = []
+    for z in logits.split(chunk, dim=1):
+        z = z.float()
+        out.append(z.logsumexp(-1) - (z.softmax(-1) * z).sum(-1))
+    return torch.cat(out, dim=1)
+
+# --------------------------------------------------------------------------
+# rollout/trainer mismatch corrections
+# --------------------------------------------------------------------------
 
 def tis_function(
     logp: torch.Tensor, old_logp: torch.Tensor, *, high: float = 2.0
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """Truncated importance sampling: weight each token by ``min(pi / pi_rollout, high)``."""
     tis = torch.exp(logp - old_logp)
-    tis_weights = tis.clamp(max=high).detach()
-    tis_frac = (tis > high).float()
-    tis_mean =(tis - 1).abs()
-    metrices = {
+    metrics = {
         "tis": tis.detach(),
-        "tis_frac": tis_frac.detach(),
-        "tis_mean": tis_mean.detach(),
+        "tis_frac": (tis > high).float().detach(),
+        "tis_mean": (tis - 1).abs().detach(),
     }
-    return metrices, tis_weights
+    return metrics, tis.clamp(max=high).detach()
+
 
 def icepop_function(
     logp: torch.Tensor, old_logp: torch.Tensor, *, low: float = 0.5, high: float = 5.0
@@ -90,15 +98,13 @@ def icepop_function(
     """
     ice = torch.exp(logp - old_logp)
     keep = (ice >= low) & (ice <= high)
-    ice_weights = torch.where(keep, ice, 0.0).detach()
-    ice_frac = (~keep).float()
-    ice_mean = (ice - 1).abs()
-    metrices = {
+    metrics = {
         "icepop": ice.detach(),
-        "icepop_frac": ice_frac.detach(),
-        "icepop_mean": ice_mean.detach(),
+        "icepop_frac": (~keep).float().detach(),
+        "icepop_mean": (ice - 1).abs().detach(),
     }
-    return metrices, ice_weights
+    return metrics, torch.where(keep, ice, 0.0).detach()
+
 
 def reduce(
     per_token: torch.Tensor,
@@ -132,9 +138,85 @@ def reduce(
     raise ValueError(f"unknown aggregation {agg!r}")
 
 
+# --------------------------------------------------------------------------
+# policy-gradient losses
+# --------------------------------------------------------------------------
+#
 # One call convention for every loss below -- ``(model, items, *, agg, n_seqs,
 # n_tokens, ref_model)``, hyper-parameters bound by ``algorithms.py``, ``**_``
 # swallowing the rest -- so the Trainer invokes any of them identically.
+#
+# Each one only writes its own surrogate; ``_policy_forward`` and ``_finish``
+# do what they share: the forward pass, the importance ratio, the TIS/IcePop
+# weight, the entropy bonus, the KL penalty and the reduction.
+
+
+@dataclass
+class _Policy:
+    """One micro-batch's forward pass, ready for a surrogate."""
+
+    p: Packed
+    logits: torch.Tensor  # [B, T-1, V]
+    logp: torch.Tensor    # [B, T-1]  log pi_theta of each realized token
+    ratio: torch.Tensor   # [B, T-1]  pi_theta / pi_old
+    weight: Optional[torch.Tensor]  # [B, T-1]  TIS/IcePop coefficient, or None
+    aux: Aux
+
+
+def _policy_forward(model, seqs: Seq[Sequence], *, n_tokens: float,
+                    tis: bool = False, icepop: bool = False) -> _Policy:
+    """Forward ``seqs`` and measure them against the policy that sampled them.
+
+    Without a correction ``pi_old`` is the rollout engine, so ``ratio`` absorbs
+    both staleness and any engine/trainer numeric gap. With ``tis`` or
+    ``icepop``, ``pi_old`` is the policy this step started from -- the same
+    weights in a one-update step, so ``ratio`` is 1 carrying the gradient of
+    ``logp`` -- and the engine gap goes to a detached per-token ``weight``.
+    """
+    p = pack(seqs, next(model.parameters()).device)
+    logits, logp = forward(model, p)
+    corrected = tis or icepop
+    ratio = torch.exp(logp - (logp.detach() if corrected else p.old_logp))
+    aux: Aux = {}
+    weight = None
+    if corrected:
+        metrics, weight = (tis_function if tis else icepop_function)(logp, p.old_logp)
+        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrics.items()})
+    return _Policy(p, logits, logp, ratio, weight, aux)
+
+
+def _finish(
+    pol: _Policy,
+    surrogate: torch.Tensor,
+    *,
+    agg: str,
+    n_seqs: float,
+    n_tokens: float,
+    ent_coef: float = 0.0,
+    kl_coef: float = 0.0,
+    ref_model=None,
+    max_tokens: Optional[int] = None,
+) -> Tuple[torch.Tensor, Aux]:
+    """``surrogate`` (per token, to maximize) -> ``(loss, aux)``::
+
+        L = -reduce( w_t * surrogate_t + alpha * H_t - beta * KL_t )
+    """
+    p, aux = pol.p, pol.aux
+    if pol.weight is not None:
+        surrogate = surrogate * pol.weight
+    surrogate = _add_entropy(surrogate, pol.logits, p.mask, n_tokens, ent_coef, aux)
+    if kl_coef:
+        if ref_model is None:
+            raise ValueError("kl_coef > 0 needs ref_model=<frozen policy>")
+        with torch.no_grad():
+            ref_logp = forward(ref_model, p)[1]
+        kl = _kl_k3(pol.logp, ref_logp)
+        surrogate = surrogate - kl_coef * kl
+        aux["kl"] = _masked_mean(kl, p.mask, n_tokens)
+    loss = -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens,
+                   max_tokens=max_tokens)
+    return loss, aux
+
 
 def clipped_surrogate(
     model,
@@ -157,38 +239,14 @@ def clipped_surrogate(
         rho_t = pi_theta(o_t) / pi_old(o_t)
         L = -E_t[ w_t * min(rho_t * A, clip(rho_t, 1-eps, 1+eps) * A)
                   - beta * KL(pi_theta || pi_ref) + alpha * H ]
-
-    Without ``tis`` ``w_t`` is one and ``pi_old`` is the rollout engine.  With it
-    ``pi_old`` is the policy this step started from and ``w_t`` is the truncated
-    ``min(pi_old / pi_rollout, C)``, so the sampler mismatch is corrected once.
     """
-    p = pack(seqs, next(model.parameters()).device)
-    logits, logp = forward(model, p)
-    ratio = torch.exp(logp - logp.detach()) if (tis or icepop) else torch.exp(logp - p.old_logp)
-    a = p.adv
-    surrogate = torch.minimum(ratio * a, ratio.clamp(1 - clip_eps, 1 + clip_eps) * a)
-
-    aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, clip_eps, clip_eps)}
-    if tis:
-        metrices, weight = tis_function(logp, p.old_logp)
-        surrogate = surrogate * weight
-        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
-    if icepop:
-        metrices, weight = icepop_function(logp, p.old_logp)
-        surrogate = surrogate * weight
-        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
-    surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
-    if kl_coef:
-        if ref_model is None:
-            raise ValueError("kl_coef > 0 needs ref_model=<frozen policy>")
-        with torch.no_grad():
-            ref_logp = forward(ref_model, p)[1]
-        kl = _kl_k3(logp, ref_logp)
-        surrogate = surrogate - kl_coef * kl
-        aux["kl"] = _masked_mean(kl, p.mask, n_tokens)
-
-    return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens,
-                   max_tokens=max_tokens), aux
+    pol = _policy_forward(model, seqs, n_tokens=n_tokens, tis=tis, icepop=icepop)
+    rho, a = pol.ratio, pol.p.adv
+    surrogate = torch.minimum(rho * a, rho.clamp(1 - clip_eps, 1 + clip_eps) * a)
+    pol.aux["clip_frac"] = _clip_frac(rho, pol.p.mask, n_tokens, clip_eps, clip_eps)
+    return _finish(pol, surrogate, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens,
+                   ent_coef=ent_coef, kl_coef=kl_coef, ref_model=ref_model,
+                   max_tokens=max_tokens)
 
 
 def cispo_surrogate(
@@ -215,22 +273,12 @@ def cispo_surrogate(
     any token that strays out of the trust region, CISPO keeps every token's
     gradient and only bounds how loudly it speaks.
     """
-    p = pack(seqs, next(model.parameters()).device)
-    logits, logp = forward(model, p)
-    ratio = torch.exp(logp - logp.detach()) if (tis or icepop) else torch.exp(logp - p.old_logp)
-    surrogate = ratio.clamp(1 - eps_low, 1 + eps_high).detach() * p.adv * logp
-
-    aux = {"clip_frac": _clip_frac(ratio, p.mask, n_tokens, eps_low, eps_high)}
-    if tis:
-        metrices, weight = tis_function(logp, p.old_logp)
-        surrogate = surrogate * weight
-        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
-    if icepop:
-        metrices, weight = icepop_function(logp, p.old_logp)
-        surrogate = surrogate * weight
-        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
-    surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
-    return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
+    pol = _policy_forward(model, seqs, n_tokens=n_tokens, tis=tis, icepop=icepop)
+    rho = pol.ratio
+    surrogate = rho.clamp(1 - eps_low, 1 + eps_high).detach() * pol.p.adv * pol.logp
+    pol.aux["clip_frac"] = _clip_frac(rho, pol.p.mask, n_tokens, eps_low, eps_high)
+    return _finish(pol, surrogate, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens,
+                   ent_coef=ent_coef)
 
 
 def score_function(
@@ -240,20 +288,9 @@ def score_function(
     """REINFORCE's score-function estimator::
         L = -E_t[ w_t * A_t * log pi_theta(a_t | s_t) + alpha * H ]
     """
-    p = pack(seqs, next(model.parameters()).device)
-    logits, logp = forward(model, p)
-    aux: Aux = {}
-    surrogate = p.adv * logp
-    if tis:
-        metrices, weight = tis_function(logp, p.old_logp)
-        surrogate = surrogate * weight
-        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
-    if icepop:
-        metrices, weight = icepop_function(logp, p.old_logp)
-        surrogate = surrogate * weight
-        aux.update({k: _masked_mean(v, p.mask, n_tokens) for k, v in metrices.items()})
-    surrogate = _add_entropy(surrogate, logits, p.mask, n_tokens, ent_coef, aux)
-    return -reduce(surrogate, p.mask, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens), aux
+    pol = _policy_forward(model, seqs, n_tokens=n_tokens, tis=tis, icepop=icepop)
+    return _finish(pol, pol.p.adv * pol.logp, agg=agg, n_seqs=n_seqs, n_tokens=n_tokens,
+                   ent_coef=ent_coef)
 
 
 def cross_entropy(
