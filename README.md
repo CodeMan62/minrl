@@ -75,7 +75,7 @@ src/minrl/      the library; the rollout engine and shared types sit at its top 
   inference/    the vLLM server and client, chat templates, and weight sync
   training/     the trainer, algorithms, losses, data sources, checkpoints, FSDP2
   eval/         evaluation on a fixed set of episodes
-enviornments/   the environments the examples train on, and the ENVS registry train.py picks from
+environments/   the environments the examples train on, and the ENVS registry train.py picks from
 train.py        the one training entry point; every example is this plus a shell script
 examples/       one folder per example, each with a self-contained run.sh
 docs/           longer notes, starting with entropy in RL

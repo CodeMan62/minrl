@@ -15,9 +15,9 @@ from minrl.envs.env import env
 from minrl.inference.parser import MoveParser, Parser, TextParser
 from minrl.types import Rollout
 
-from enviornments.dapo_math import DAPOMath
-from enviornments.gsm8k import GSM8K, GSM8K_SYSTEM_PROMPT
-from enviornments.tic_tac_toe import TicTacToe
+from environments.dapo_math import DAPOMath
+from environments.gsm8k import GSM8K, GSM8K_SYSTEM_PROMPT
+from environments.tic_tac_toe import TicTacToe
 
 #: ``make(split, *, limit, shuffle, seed, **options)`` -> a fresh env.
 #: ``options`` are the ``--env-arg key=value`` pairs from the command line.
@@ -63,7 +63,7 @@ ENVS: Dict[str, EnvSpec] = {
         success=_solved,
     ),
     "dapo_math": EnvSpec(
-        # Options: dataset, config, eval_dataset (see enviornments/dapo_math.py).
+        # Options: dataset, config, eval_dataset (see environments/dapo_math.py).
         make=lambda split, *, limit, shuffle, seed, **options: DAPOMath(
             split, limit=limit, shuffle=shuffle, seed=seed, **options
         ),

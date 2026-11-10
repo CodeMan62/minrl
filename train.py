@@ -20,7 +20,7 @@ its own groups::
 
     CUDA_VISIBLE_DEVICES=1,2,3 torchrun --standalone --nproc_per_node=3 train.py ...
 
-The environment comes from ``enviornments.ENVS`` by ``--env``; anything an
+The environment comes from ``environments.ENVS`` by ``--env``; anything an
 environment wants beyond split/limit/shuffle/seed goes through
 ``--env-arg key=value``. Generation runs on vLLM the whole time: the rollout
 engine keeps ``--concurrency`` groups in flight while the trainer steps, and
@@ -51,9 +51,9 @@ from minrl.training.config import TrainerConfig
 from minrl.training.sources import RolloutSource
 from minrl.training.trainer import Trainer
 
-# ``enviornments`` lives next to this file and is not an installed package.
+# ``environments`` lives next to this file and is not an installed package.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from enviornments import ENVS, EnvSpec  # noqa: E402
+from environments import ENVS, EnvSpec  # noqa: E402
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -87,7 +87,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="what vLLM does with in-flight requests during a push: freeze, drain, drop, nothing")
 
     g = p.add_argument_group("environment and data")
-    g.add_argument("--env", required=True, choices=sorted(ENVS), help="entry in enviornments.ENVS")
+    g.add_argument("--env", required=True, choices=sorted(ENVS), help="entry in environments.ENVS")
     g.add_argument("--env-arg", action="append", metavar="KEY=VALUE",
                    help="environment option, JSON-parsed when it parses; repeatable")
     g.add_argument("--train-split", default="train")

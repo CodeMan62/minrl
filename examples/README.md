@@ -10,7 +10,7 @@ train.py                        the training loop glue; never edited per experim
 examples/dapo-math/run.sh       Qwen3.5-0.8B, GRPO + TIS on DAPO-Math-17k, eval on MATH-500
 examples/gsm8k/run.sh           Qwen2.5-0.5B-Instruct, GRPO on GSM8K
 examples/tic-tac-toe/run.sh     Qwen3-0.6B, GRPO against a random opponent
-enviornments/__init__.py        ENVS: the registry --env picks from
+environments/__init__.py        ENVS: the registry --env picks from
 ```
 
 ## Run
@@ -39,8 +39,8 @@ Both GPUs must share a host: the weights go from trainer to server over NCCL.
 ## Add an example
 
 Copy a `run.sh` into a new folder and change the arrays. A new environment is
-a class under `enviornments/` plus one `EnvSpec` entry in
-`enviornments/__init__.py`: how to build it for a split, which parser turns
+a class under `environments/` plus one `EnvSpec` entry in
+`environments/__init__.py`: how to build it for a split, which parser turns
 the model's text into an action, the system prompt, the max steps per
 episode, and what counts as success. Options the environment needs beyond
 split, limit, shuffle and seed come in as `--env-arg key=value`.
