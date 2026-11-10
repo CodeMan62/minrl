@@ -138,7 +138,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="memory knob only; one step is always the whole batch")
     g.add_argument("--strategy", default="auto", choices=["auto", "none", "fsdp"])
     g.add_argument("--mixed-precision", default="bf16", choices=["bf16", "fp16", "fp32"],
-                   help="FSDP compute dtype; single-GPU runs compute in --dtype")
+                   help="compute dtype: FSDP's cast policy, or autocast over fp32 weights on one GPU "
+                        "(fp16 adds loss scaling)")
     g.add_argument("--cpu-offload", action="store_true")
 
     g = p.add_argument_group("eval")

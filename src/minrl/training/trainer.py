@@ -1,6 +1,7 @@
 """The one update loop."""
 from __future__ import annotations
 
+import contextlib
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,7 @@ class Trainer:
             # No backward ever follows a ref forward: reshard its root too.
             self.ref_model = self._shard(ref_model, reshard_after_forward=True)
         self.optimizer = self.initialize_optimizer()
+        self._init_autocast()
 
     def _shard(self, model: nn.Module, **kwargs) -> nn.Module:
         return dist.shard(
@@ -63,6 +65,31 @@ class Trainer:
             cpu_offload=self.cfg.cpu_offload,
             **kwargs,
         )
+
+    def _init_autocast(self) -> None:
+        """Unsharded fp32 weights compute in ``mixed_precision`` under autocast.
+
+        FSDP casts through its own policy; here the weights and Adam state stay
+        fp32 while matmuls run in fp16/bf16, which is what a T4's tensor cores
+        are fast at. fp16's narrow range needs loss scaling or small gradients
+        flush to zero; bf16 has fp32's range and does not.
+        """
+        cfg = self.cfg
+        sharded = dist.world_size() > 1 and cfg.strategy != "none"
+        fp32 = next(self.model.parameters()).dtype == torch.float32
+        on_cuda = next(self.model.parameters()).device.type == "cuda"
+        self.autocast_dtype = (
+            dist.DTYPES[cfg.mixed_precision]
+            if not sharded and fp32 and on_cuda and cfg.mixed_precision != "fp32" else None
+        )
+        self.scaler = (
+            torch.amp.GradScaler("cuda") if self.autocast_dtype == torch.float16 else None
+        )
+
+    def _compute(self):
+        if self.autocast_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast("cuda", dtype=self.autocast_dtype)
 
     def initialize_optimizer(self) -> optim.Optimizer:
         return optim.AdamW(
@@ -109,30 +136,42 @@ class Trainer:
         aux: Dict[str, float] = {}
         size = self.cfg.micro_batch_size
         for i in range(0, len(items), size):
-            loss, extra = algo.loss(
-                self.model, items[i : i + size],
-                n_seqs=n_seqs / world, n_tokens=n_tokens / world,
-                ref_model=self.ref_model,
-            )
-            loss.backward()
+            with self._compute():
+                loss, extra = algo.loss(
+                    self.model, items[i : i + size],
+                    n_seqs=n_seqs / world, n_tokens=n_tokens / world,
+                    ref_model=self.ref_model,
+                )
+            (self.scaler.scale(loss) if self.scaler else loss).backward()
             total_loss += loss.item()
             # Every metric is already divided by a step-wide count, so summing
             # over micro-batches gives its value for the whole step.
             for k, v in extra.items():
                 aux[k] = aux.get(k, 0.0) + v
 
-        # 4. update the policy
+        # 4. update the policy; under fp16 loss scaling the gradients are
+        #    unscaled before clipping, and a step that overflowed is skipped
+        #    while the scale backs off.
+        if self.scaler:
+            self.scaler.unscale_(self.optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.cfg.max_grad_norm
         )
-        self.optimizer.step()
+        if self.scaler:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
-        return {
+        out = {
             **metrics,
             **dist.mean_all({**aux, "loss": total_loss}),
             "grad_norm": float(grad_norm),
             "skipped": 0.0,
         }
+        if self.scaler:
+            out["loss_scale"] = float(self.scaler.get_scale())
+        return out
 
     def train(self, num_steps: int) -> Iterator[Dict[str, float]]:
         """Run until ``self.step == num_steps``; resumes from a loaded checkpoint."""
@@ -236,7 +275,11 @@ class Trainer:
                 },
                 "torch": torch.__version__,
             },
-            rank_state={"rng": checkpoint.rng_state(), "source": self.source.state_dict()},
+            rank_state={
+                "rng": checkpoint.rng_state(),
+                "source": self.source.state_dict(),
+                **({"scaler": self.scaler.state_dict()} if self.scaler else {}),
+            },
             keep_last=self.cfg.keep_last,
         )
 
@@ -259,5 +302,7 @@ class Trainer:
             checkpoint.set_rng_state(ck.rank["rng"])
         if "source" in ck.rank:
             self.source.load_state_dict(ck.rank["source"])
+        if self.scaler and "scaler" in ck.rank:
+            self.scaler.load_state_dict(ck.rank["scaler"])
         # The runtime still holds the base weights; serve the resumed policy.
         self.push_weights_to_runtime()

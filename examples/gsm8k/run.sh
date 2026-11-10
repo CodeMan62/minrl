@@ -35,11 +35,12 @@ MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
 
 MODEL_ARGS=(
     --model "$MODEL"
-    --dtype fp32
+    --dtype fp32               # weights + Adam state; fp16 Adam state underflows
+    --mixed-precision fp16     # matmuls under autocast with loss scaling (T4 has no bf16)
 )
 
 VLLM_ARGS=(
-    --dtype float32
+    --dtype float16
     --max-model-len 4096
     --gpu-memory-utilization 0.7
     --logprobs-mode processed_logprobs
@@ -54,9 +55,9 @@ ENV_ARGS=(
 
 ROLLOUT_ARGS=(
     --group-size 8
-    --groups-per-step 1
-    --concurrency 2
-    --max-new-tokens 1024
+    --groups-per-step 4
+    --concurrency 8
+    --max-new-tokens 768
     --temperature 1.0
 )
 
@@ -65,11 +66,12 @@ ALGO_ARGS=(
     --clip-eps 0.2
     --kl-coef 0.0
     --ent-coef 0.0
+    --tis                      # correct for stale / fp16-sampled rollouts
 )
 
 OPTIMIZER_ARGS=(
     --lr 1e-6
-    --adam-eps 1e-4
+    --adam-eps 1e-8
     --max-grad-norm 1.0
 )
 
@@ -81,8 +83,8 @@ TRAIN_ARGS=(
 )
 
 EVAL_ARGS=(
-    --eval-every 20
-    --eval-samples 200
+    --eval-every 100
+    --eval-samples 1319        # the full test split
     --eval-concurrency 16
     --eval-temperature 0.0
 )
@@ -107,6 +109,13 @@ stop_server() {
         wait "$SERVER_PID" 2>/dev/null || true
     fi
 }
+HEALTH="http://$VLLM_HOST:$VLLM_PORT/minrl/health"
+if [[ -z "${SKIP_SERVER:-}" ]] && curl -sf "$HEALTH" >/dev/null 2>&1; then
+    echo "a server is already answering on port $VLLM_PORT: $(curl -s "$HEALTH")" >&2
+    echo "it is likely left over from an earlier run; stop it (pkill -f vllm), or set" >&2
+    echo "SKIP_SERVER=1 to attach to it on purpose" >&2
+    exit 1
+fi
 if [[ -z "${SKIP_SERVER:-}" ]]; then
     echo "starting vLLM on GPU $ROLLOUT_GPU, log: $LOG_DIR/vllm_server.log"
     CUDA_VISIBLE_DEVICES=$ROLLOUT_GPU "${PYTHON_CMD[@]}" -m minrl.inference.vllm_server "$MODEL" "${VLLM_ARGS[@]}" \
@@ -115,7 +124,6 @@ if [[ -z "${SKIP_SERVER:-}" ]]; then
     trap stop_server EXIT INT TERM
 fi
 
-HEALTH="http://$VLLM_HOST:$VLLM_PORT/minrl/health"
 deadline=$(( $(date +%s) + SERVER_TIMEOUT ))
 until curl -sf "$HEALTH" >/dev/null 2>&1; do
     if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
