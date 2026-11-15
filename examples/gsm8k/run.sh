@@ -35,11 +35,11 @@ MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
 
 MODEL_ARGS=(
     --model "$MODEL"
-    --dtype fp32
+    --dtype fp16
 )
 
 VLLM_ARGS=(
-    --dtype float32
+    --dtype float16
     --max-model-len 4096
     --gpu-memory-utilization 0.7
     --logprobs-mode processed_logprobs
@@ -75,8 +75,7 @@ OPTIMIZER_ARGS=(
 
 TRAIN_ARGS=(
     --iterations 100
-    --micro-batch-size 1
-    --activation-checkpointing
+    --micro-batch-size 2
     --seed 0
 )
 
@@ -134,7 +133,6 @@ if (( NGPU > 1 )); then
     LAUNCHER=("${PYTHON_CMD[@]}" -m torch.distributed.run --standalone --nproc_per_node="$NGPU")
 fi
 echo "training on GPU(s) $TRAIN_GPUS, log: $LOG_DIR/train.log"
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS "${LAUNCHER[@]}" train.py \
     --vllm-url "http://$VLLM_HOST:$VLLM_PORT" \
     --weight-transfer-host "$VLLM_HOST" \
