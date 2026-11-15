@@ -56,14 +56,20 @@ def forward(model, p: Packed) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def entropy(logits: torch.Tensor) -> torch.Tensor:
+#TODO: chunk is temp find a better way
+def entropy(logits: torch.Tensor, chunk: int = 512) -> torch.Tensor:
     """Per-token entropy of the policy, in nats: ``logsumexp(z) - sum_v p_v z_v``.
 
     How undecided the policy is over the whole vocabulary at each position,
     unlike ``logp``, which only scores the one token that was sampled.
     """
-    logits = logits.float()
-    return logits.logsumexp(-1) - (logits.softmax(-1) * logits).sum(-1)
+    flat = logits.reshape(-1, logits.size(-1))
+    out = []
+    for z in flat.split(chunk):
+        z = z.float()
+        out.append(z.logsumexp(-1) - (z.softmax(-1) * z).sum(-1))
+    return torch.cat(out).view(logits.shape[:-1])
+
 
 def tis_function(
     logp: torch.Tensor, old_logp: torch.Tensor, *, high: float = 2.0
