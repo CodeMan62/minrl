@@ -26,6 +26,15 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 _TOKEN_ID_FLAG = "--return-tokens-as-token-ids"
 _NO_TOKEN_ID_FLAG = "--no-return-tokens-as-token-ids"
+# vLLM's default ("auto") applies the checkpoint's generation_config.json as
+# default sampling params -- Qwen2.5 ships repetition_penalty=1.1, top_k=20 --
+# so rollouts would come from a different policy than the one being trained.
+_GEN_CONFIG_FLAG = "--generation-config"
+# Prefix-cached KV blocks survive a weight update: after a push, new requests
+# would reuse prompt KV computed by the *old* weights (a GRPO group and every
+# eval share prompts, so the hit rate is high). Off unless asked for.
+_PREFIX_CACHE_FLAG = "--enable-prefix-caching"
+_NO_PREFIX_CACHE_FLAG = "--no-enable-prefix-caching"
 
 # minrl's own endpoints live under /minrl;
 router = APIRouter(prefix="/minrl")
@@ -61,17 +70,24 @@ async def update_weights(request: Request) -> dict:
     body = await request.json()
     engine = request.app.state.engine_client
     await engine.collective_rpc("receive_weights", kwargs={"weights": body["weights"]})
+    # Drop KV cached under the old weights (no-op with prefix caching off). It
+    # only succeeds with no request running; in-flight ones keep their KV.
+    await engine.reset_prefix_cache()
     if body.get("version") is not None:
         await engine.update_weight_version(str(body["version"]))
     return {"status": "ok", "weight_version": await engine.get_weight_version()}
 
 
 def build_serve_argv(model: str, extra: Sequence[str] = ()) -> List[str]:
-    """Build the ``vllm serve`` argv, injecting minrl's required flag."""
+    """Build the ``vllm serve`` argv, injecting minrl's required flags."""
     extra = list(extra)
     argv = ["vllm", "serve", model]
     if _TOKEN_ID_FLAG not in extra and _NO_TOKEN_ID_FLAG not in extra:
         argv.append(_TOKEN_ID_FLAG)
+    if not any(a == _GEN_CONFIG_FLAG or a.startswith(_GEN_CONFIG_FLAG + "=") for a in extra):
+        argv += [_GEN_CONFIG_FLAG, "vllm"]
+    if _PREFIX_CACHE_FLAG not in extra and _NO_PREFIX_CACHE_FLAG not in extra:
+        argv.append(_NO_PREFIX_CACHE_FLAG)
     argv.extend(extra)
     return argv
 

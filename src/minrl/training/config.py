@@ -18,6 +18,7 @@ class TrainerConfig:
     # --- dist (FSDP2; see dist.shard) ---
     strategy: str = "auto"  # auto | none | fsdp
     mixed_precision: str = "bf16"  # bf16 | fp16 | fp32: compute dtype under FSDP
+    autocast: Optional[str] = None # None | fp16 | bf16
     cpu_offload: bool = False
     activation_checkpointing: bool = False
 

@@ -33,9 +33,12 @@ SERVER_TIMEOUT=${SERVER_TIMEOUT:-900}
 # ---- model: a plain dense model, no thinking mode
 MODEL=${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
 
+# The trainer steps in fp32: in fp16 an Adam step of ~lr=1e-6 is below the
+# weights' resolution and rounds away for ~80% of them (bf16: ~98%), so the
+# policy barely moves. vLLM can still sample in fp16.
 MODEL_ARGS=(
     --model "$MODEL"
-    --dtype fp16
+    --dtype fp32
 )
 
 VLLM_ARGS=(
@@ -54,8 +57,8 @@ ENV_ARGS=(
 
 ROLLOUT_ARGS=(
     --group-size 8
-    --groups-per-step 1
-    --concurrency 2
+    --groups-per-step 8        # 64 sequences / 8 prompts per optimizer step
+    --concurrency 8
     --max-new-tokens 1024
     --temperature 1.0
 )
@@ -68,14 +71,15 @@ ALGO_ARGS=(
 )
 
 OPTIMIZER_ARGS=(
-    --lr 1e-6
-    --adam-eps 1e-4
+    --lr 2e-6
+    --adam-eps 1e-8
     --max-grad-norm 1.0
 )
 
 TRAIN_ARGS=(
     --iterations 100
-    --micro-batch-size 2
+    --micro-batch-size 1       # fp32 + Adam leaves ~7 GB of 16 GB for activations
+    --activation-checkpointing
     --seed 0
 )
 
@@ -133,6 +137,7 @@ if (( NGPU > 1 )); then
     LAUNCHER=("${PYTHON_CMD[@]}" -m torch.distributed.run --standalone --nproc_per_node="$NGPU")
 fi
 echo "training on GPU(s) $TRAIN_GPUS, log: $LOG_DIR/train.log"
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS "${LAUNCHER[@]}" train.py \
     --vllm-url "http://$VLLM_HOST:$VLLM_PORT" \
     --weight-transfer-host "$VLLM_HOST" \

@@ -139,6 +139,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--strategy", default="auto", choices=["auto", "none", "fsdp"])
     g.add_argument("--mixed-precision", default="bf16", choices=["bf16", "fp16", "fp32"],
                    help="FSDP compute dtype; single-GPU runs compute in --dtype")
+    g.add_argument("--autocast", default="none", choices=["none", "fp16", "bf16"],
+                   help="unsharded runs: compute in this dtype, keep fp32 weights and Adam "
+                        "state (needs --dtype fp32); fp16 adds loss scaling")
     g.add_argument("--cpu-offload", action="store_true")
 
     g = p.add_argument_group("eval")
@@ -353,6 +356,7 @@ def main() -> None:
             max_grad_norm=args.max_grad_norm,
             strategy=args.strategy,
             mixed_precision=args.mixed_precision,
+            autocast=None if args.autocast == "none" else args.autocast,
             cpu_offload=args.cpu_offload,
             activation_checkpointing=args.activation_checkpointing,
             ckpt_dir=args.ckpt_dir,

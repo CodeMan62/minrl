@@ -55,6 +55,17 @@ class Trainer:
             self.ref_model = self._shard(ref_model, reshard_after_forward=True)
         self.optimizer = self.initialize_optimizer()
 
+        # Mixed precision without FSDP: fp32 master weights, half-precision compute.
+        self._amp_dtype = None
+        if config.autocast:
+            if dist.world_size() > 1 and config.strategy != "none":
+                raise ValueError("autocast is for unsharded runs; under FSDP use mixed_precision")
+            if next(self.model.parameters()).dtype != torch.float32:
+                raise ValueError("autocast needs fp32 weights (--dtype fp32); the point is fp32 master weights")
+            self._amp_dtype = dist.DTYPES[config.autocast]
+        # fp16 gradients underflow without loss scaling; bf16 has fp32's range and needs none.
+        self._scaler = torch.amp.GradScaler("cuda") if self._amp_dtype == torch.float16 else None
+
     def _shard(self, model: nn.Module, **kwargs) -> nn.Module:
         return dist.shard(
             model,
@@ -109,12 +120,13 @@ class Trainer:
         aux: Dict[str, float] = {}
         size = self.cfg.micro_batch_size
         for i in range(0, len(items), size):
-            loss, extra = algo.loss(
-                self.model, items[i : i + size],
-                n_seqs=n_seqs / world, n_tokens=n_tokens / world,
-                ref_model=self.ref_model,
-            )
-            loss.backward()
+            with torch.autocast("cuda", dtype=self._amp_dtype, enabled=self._amp_dtype is not None):
+                loss, extra = algo.loss(
+                    self.model, items[i : i + size],
+                    n_seqs=n_seqs / world, n_tokens=n_tokens / world,
+                    ref_model=self.ref_model,
+                )
+            (self._scaler.scale(loss) if self._scaler else loss).backward()
             total_loss += loss.item()
             # Every metric is already divided by a step-wide count, so summing
             # over micro-batches gives its value for the whole step.
@@ -122,16 +134,26 @@ class Trainer:
                 aux[k] = aux.get(k, 0.0) + v
 
         # 4. update the policy
+        amp_skipped = 0.0
+        if self._scaler:
+            self._scaler.unscale_(self.optimizer)  # clip the true gradient, not the scaled one
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.cfg.max_grad_norm
         )
-        self.optimizer.step()
+        if self._scaler:
+            scale = self._scaler.get_scale()
+            self._scaler.step(self.optimizer)  # skipped if the gradient overflowed
+            self._scaler.update()
+            amp_skipped = float(self._scaler.get_scale() < scale)
+        else:
+            self.optimizer.step()
 
         return {
             **metrics,
             **dist.mean_all({**aux, "loss": total_loss}),
             "grad_norm": float(grad_norm),
-            "skipped": 0.0,
+            "skipped": amp_skipped,
+            **({"amp_scale": float(self._scaler.get_scale())} if self._scaler else {}),
         }
 
     def train(self, num_steps: int) -> Iterator[Dict[str, float]]:
@@ -235,6 +257,7 @@ class Trainer:
                     "cpu_offload": self.cfg.cpu_offload,
                 },
                 "torch": torch.__version__,
+                "grad_scaler": self._scaler.state_dict() if self._scaler else None,
             },
             rank_state={"rng": checkpoint.rng_state(), "source": self.source.state_dict()},
             keep_last=self.cfg.keep_last,
@@ -255,6 +278,8 @@ class Trainer:
             warnings.warn(f"config differs from the checkpoint's: {changed}", stacklevel=2)
         dist.load_state(self.model, self.optimizer, ck.model, ck.optimizer)
         self.step, self.tokens, self.sequences = saved["step"], saved["tokens"], saved["sequences"]
+        if self._scaler and saved.get("grad_scaler"):
+            self._scaler.load_state_dict(saved["grad_scaler"])
         if "rng" in ck.rank:
             checkpoint.set_rng_state(ck.rank["rng"])
         if "source" in ck.rank:
