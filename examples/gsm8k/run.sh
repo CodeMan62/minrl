@@ -5,6 +5,8 @@
 #   examples/gsm8k/run.sh
 #   examples/gsm8k/run.sh --eval-only
 #   TRAIN_GPUS=1,2,3 examples/gsm8k/run.sh          # FSDP2 on three training GPUs
+#   ./examples/gsm8k/run.sh --groups-per-step 32 --lr 1e-6 --autocast fp16 \
+#       --micro-batch-size 4 --max-new-tokens 512 --iterations 60 --eval-every 10
 #
 # Anything appended is passed to train.py and overrides the arrays below.
 #
