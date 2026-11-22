@@ -20,7 +20,6 @@ examples = [
     "wandb>=0.17",
     "peft>=0.14",
     "datasets>=3.0",
-    "math-verify>=0.7",
 ]
 
 [dependency-groups]

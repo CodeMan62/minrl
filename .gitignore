@@ -11,7 +11,3 @@ wheels/
 
 # Local wandb run cache (synced to wandb.ai already)
 wandb/
-
-# Training outputs
-ckpts/
-logs/
