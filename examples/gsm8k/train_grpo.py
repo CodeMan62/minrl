@@ -21,7 +21,10 @@ import os
 import random
 import sys
 
-import torch
+# Rollout lengths vary every step, which fragments the CUDA cache; must be set before torch.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import torch  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from minrl.agents.llm_agent import LLMAgent
@@ -50,17 +53,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-transfer-port", type=int, default=29501)
     p.add_argument("--iterations", type=int, default=100)
     p.add_argument("--group-size", type=int, default=8)
+    p.add_argument("--groups-per-step", type=int, default=8,
+                   help="questions per optimizer step; one group of --group-size answers each")
+    p.add_argument("--keep-uniform", dest="drop_uniform", action="store_false",
+                   help="keep groups whose answers all scored the same (zero advantage)")
     p.add_argument("--lr", type=float, default=1e-6)
-    p.add_argument("--adam-eps", type=float, default=1e-4)
+    p.add_argument("--adam-eps", type=float, default=1e-8)
     p.add_argument("--max-new-tokens", type=int, default=1024)
-    p.add_argument("--micro-batch-size", type=int, default=2)
+    p.add_argument("--micro-batch-size", type=int, default=1,
+                   help="memory knob only; the step's gradient is the same at any size")
+    p.add_argument("--activation-checkpointing", action="store_true",
+                   help="trade compute for memory on small training GPUs")
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--clip-eps", type=float, default=0.2)
-    p.add_argument("--concurrency", type=int, default=2,
+    p.add_argument("--concurrency", type=int, default=16,
                    help="groups generating at once while the trainer steps")
     p.add_argument("--eval-every", type=int, default=20)
-    p.add_argument("--eval-samples", type=int, default=200)
-    p.add_argument("--eval-concurrency", type=int, default=16)
+    p.add_argument("--eval-samples", type=int, default=None,
+                   help="test questions per eval; default is all 1319 (fewer is noisy: "
+                        "200 has a ~3.5-point standard error)")
+    p.add_argument("--eval-concurrency", type=int, default=64)
     p.add_argument("--eval-dump", default=None, help="dir for per-rollout jsonl dumps")
     p.add_argument("--train-limit", type=int, default=None)
     p.add_argument("--train-split", default="train", choices=["train", "test"])
@@ -88,8 +100,11 @@ def main() -> None:
     random.seed(args.seed + rank)
 
     if main:
-        print(f"loading {args.model} on {dist.world_size()} GPU(s) (float16) ...")
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
+        print(f"loading {args.model} on {dist.world_size()} GPU(s) (float32 weights, fp16 compute) ...")
+    # Master weights and AdamW state must be float32: in fp16 Adam's second
+    # moment underflows and the update stops being Adam. fp16 is only the
+    # compute dtype, applied by the trainer (autocast or FSDP).
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
     model.to(device)
     model.config.use_cache = False
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -124,16 +139,19 @@ def main() -> None:
     trainer = Trainer(
         model,
         algorithm=grpo(clip_eps=args.clip_eps, group_size=args.group_size),
-        # One group per step: group_size answers to one question, the set the
-        # group-relative advantages are computed over.
+        # groups_per_step groups per step: group_size answers to each question,
+        # the set the group-relative advantages are computed over. Groups that
+        # all scored the same teach nothing and are swapped for fresh ones.
         source=RolloutSource(
-            make_train, batch_size=args.group_size, max_steps=1, group_size=args.group_size,
-            concurrency=args.concurrency,
+            make_train, batch_size=args.groups_per_step * args.group_size, max_steps=1,
+            group_size=args.group_size, concurrency=args.concurrency,
+            drop_uniform=args.drop_uniform,
         ),
         config=TrainerConfig(
             lr=args.lr,
             eps=args.adam_eps,
             micro_batch_size=args.micro_batch_size,
+            activation_checkpointing=args.activation_checkpointing,
             max_grad_norm=args.max_grad_norm,
             mixed_precision="fp16",
             ckpt_dir=args.ckpt_dir,
@@ -151,20 +169,28 @@ def main() -> None:
     # Eval is rank 0's job: it talks to vLLM, which already holds the synced
     # policy, and the other ranks just wait at their next collective.
     evaluator = Eval(
-        EvalConfig(model=args.model, num_episodes=args.eval_samples, max_steps=1,
+        EvalConfig(model=args.model, num_episodes=args.eval_samples or len(load_pairs("test")),
+                   max_steps=1,
                    concurrency=args.eval_concurrency, dump_dir=args.eval_dump),
         make_eval, logger=logger,
     ) if main else None
     evals = [evaluator.evaluate_sync(step=trainer.step)] if main else []
 
+    # Train success rate over the last 20 steps, counting dropped groups too:
+    # a far steadier learning signal than one step or a small eval.
+    recent = []
     for metrics in trainer.train(num_steps=args.iterations):
         step = int(metrics["step"])
         if not main:
             continue
+        recent = (recent + [metrics.get("sampled_return", metrics.get("mean_return", 0.0))])[-20:]
         print(
             f"[iter {step:>4}/{args.iterations}] "
             f"return={metrics.get('mean_return', float('nan')):+.2f} "
+            f"solved@20={sum(recent) / len(recent):.1%} "
             f"loss={metrics.get('loss', float('nan')):+.4f} "
+            f"grad={metrics.get('grad_norm', 0):.3f} "
+            f"dropped={metrics.get('dropped_groups', 0):.0f} "
             f"tokens={metrics.get('n_tokens', 0):.0f}"
         )
         if step % args.eval_every == 0 and step < args.iterations:

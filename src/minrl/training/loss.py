@@ -56,6 +56,10 @@ def forward(model, p: Packed) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+#: action-token rows per entropy-metric chunk; bounds its fp32 [rows, vocab] temporaries
+ENTROPY_CHUNK = 256
+
+
 def entropy(logits: torch.Tensor) -> torch.Tensor:
     """Per-token entropy of the policy, in nats: ``logsumexp(z) - sum_v p_v z_v``.
 
@@ -319,9 +323,18 @@ def _add_entropy(
     """Log mean policy entropy, and add ``ent_coef * H`` to the surrogate.
 
     With ``ent_coef=0`` entropy is a metric only, computed without a graph.
+    Either way only action tokens are scored, and the metric in row chunks:
+    a full-vocabulary fp32 softmax over every position of a micro-batch is
+    gigabytes for a 150k vocabulary.
     """
-    with torch.set_grad_enabled(bool(ent_coef)):
-        ent = entropy(logits)
+    sel = mask.bool()
+    if ent_coef:
+        ent = torch.zeros_like(mask)
+        ent[sel] = entropy(logits[sel])
+    else:
+        with torch.no_grad():
+            ent = torch.zeros_like(mask)
+            ent[sel] = torch.cat([entropy(c) for c in logits[sel].split(ENTROPY_CHUNK)])
     aux["entropy"] = _masked_mean(ent, mask, n_tokens)
     return surrogate + ent_coef * ent if ent_coef else surrogate
 

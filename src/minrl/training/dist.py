@@ -47,6 +47,11 @@ def is_main() -> bool:
 # sharding
 # --------------------------------------------------------------------------
 
+def will_shard(strategy: str) -> bool:
+    """Whether :func:`shard` wraps the model in FSDP under ``strategy``."""
+    return not (strategy == "none" or (strategy == "auto" and world_size() == 1))
+
+
 def shard(
     model: nn.Module,
     *,
@@ -55,7 +60,7 @@ def shard(
     cpu_offload: bool = False,
     reshard_after_forward: Optional[bool] = None,
 ) -> nn.Module:
-    if strategy == "none" or (strategy == "auto" and world_size() == 1):
+    if not will_shard(strategy):
         return model
     if strategy not in ("auto", "fsdp"):
         raise ValueError(f"unknown strategy {strategy!r}; use auto | none | fsdp")

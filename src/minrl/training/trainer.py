@@ -1,6 +1,7 @@
 """The one update loop."""
 from __future__ import annotations
 
+import contextlib
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -38,13 +39,34 @@ class Trainer:
         self.logger = logger
         self.runtime = runtime
         self._runtime_link: Optional[PyNcclCommunicator] = None  # rank 0's NCCL group, opened on first push
+        self._runtime_dtype: Optional[torch.dtype] = None  # what the runtime serves in; set with the link
         self.step = 0
         self.tokens = 0  # action tokens trained on so far, across every rank
         self.sequences = 0
 
         if config.activation_checkpointing:
             model.gradient_checkpointing_enable()
+        low = [n for n, p in model.named_parameters() if p.requires_grad and p.dtype != torch.float32]
+        if low and dist.is_main():
+            # AdamW's second moment (g**2 * (1 - beta2), ~1e-9 for RL gradients)
+            # underflows to zero in fp16, so every step silently becomes
+            # lr * m / eps -- not Adam -- and small updates round away.
+            warnings.warn(
+                f"{len(low)} trainable parameters are {model.get_parameter(low[0]).dtype}, not "
+                "float32; the optimizer state will lose precision. Load the model in float32 "
+                "and let `mixed_precision` pick the compute dtype.",
+                stacklevel=2,
+            )
         self.model = self._shard(model)
+        # FSDP applies `mixed_precision` itself; unsharded, autocast does it.
+        sharded = dist.will_shard(config.strategy)
+        device = next(model.parameters()).device
+        amp = dist.DTYPES[config.mixed_precision]
+        self._amp_dtype = amp if (not sharded and device.type == "cuda" and amp != torch.float32) else None
+        # fp16 has no headroom for small gradients; scale the loss so they survive backward.
+        self._scaler = (
+            torch.amp.GradScaler("cuda") if self._amp_dtype == torch.float16 and not low else None
+        )
         self.ref_model = ref_model
         if ref_model is not None:
             # Frozen once here, not re-frozen on every step.
@@ -108,13 +130,15 @@ class Trainer:
         total_loss = 0.0
         aux: Dict[str, float] = {}
         size = self.cfg.micro_batch_size
+        scaler = self._scaler
         for i in range(0, len(items), size):
-            loss, extra = algo.loss(
-                self.model, items[i : i + size],
-                n_seqs=n_seqs / world, n_tokens=n_tokens / world,
-                ref_model=self.ref_model,
-            )
-            loss.backward()
+            with self._autocast():
+                loss, extra = algo.loss(
+                    self.model, items[i : i + size],
+                    n_seqs=n_seqs / world, n_tokens=n_tokens / world,
+                    ref_model=self.ref_model,
+                )
+            (scaler.scale(loss) if scaler else loss).backward()
             total_loss += loss.item()
             # Every metric is already divided by a step-wide count, so summing
             # over micro-batches gives its value for the whole step.
@@ -122,10 +146,16 @@ class Trainer:
                 aux[k] = aux.get(k, 0.0) + v
 
         # 4. update the policy
+        if scaler:
+            scaler.unscale_(self.optimizer)  # clip the true gradients, not the scaled ones
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.cfg.max_grad_norm
         )
-        self.optimizer.step()
+        if scaler:
+            scaler.step(self.optimizer)  # skips the step if any gradient overflowed
+            scaler.update()
+        else:
+            self.optimizer.step()
 
         return {
             **metrics,
@@ -133,6 +163,11 @@ class Trainer:
             "grad_norm": float(grad_norm),
             "skipped": 0.0,
         }
+
+    def _autocast(self):
+        if self._amp_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast("cuda", dtype=self._amp_dtype)
 
     def train(self, num_steps: int) -> Iterator[Dict[str, float]]:
         """Run until ``self.step == num_steps``; resumes from a loaded checkpoint."""
@@ -169,7 +204,12 @@ class Trainer:
         if self._runtime_link is None:
             self._runtime_link = self._open_runtime_link()
         link, cfg = self._runtime_link, self.cfg
-        meta = [(name, str(p.dtype).removeprefix("torch."), list(p.shape)) for name, p in params]
+        # Send in the runtime's own dtype: fp32 master weights would double the
+        # traffic only for vLLM to cast them down on arrival.
+        dtype = self._runtime_dtype
+        meta = [
+            (name, str(dtype or p.dtype).removeprefix("torch."), list(p.shape)) for name, p in params
+        ]
         if cfg.sync_pause:
             self.runtime.pause(cfg.sync_pause)
         # The workers sit in receive_weights until the last broadcast lands,
@@ -181,7 +221,10 @@ class Trainer:
             stream = torch.cuda.current_stream(link.device)
             with torch.no_grad():
                 for _, p in params:
-                    link.broadcast(dist.full_tensor(p).contiguous(), src=0, stream=stream)
+                    t = dist.full_tensor(p)
+                    if dtype is not None:
+                        t = t.to(dtype)
+                    link.broadcast(t.contiguous(), src=0, stream=stream)
             stream.synchronize()
             future.result()
         finally:
@@ -192,7 +235,10 @@ class Trainer:
     def _open_runtime_link(self) -> PyNcclCommunicator:
         """Rank 0 forms one NCCL group with the runtime's workers: itself as rank 0, them after."""
         cfg = self.cfg
-        world_size = 1 + int(self.runtime.wait_ready()["world_size"])
+        health = self.runtime.wait_ready()
+        world_size = 1 + int(health["world_size"])
+        served = getattr(torch, str(health.get("dtype", "")).removeprefix("torch."), None)
+        self._runtime_dtype = served if isinstance(served, torch.dtype) else None
         device = torch.device("cuda", torch.cuda.current_device())
         # The workers block inside init_weight_sync until rank 0 joins the
         # rendezvous, so the request runs on a thread while we join it.

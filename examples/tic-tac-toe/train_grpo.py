@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iterations", type=int, default=150)
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=5e-6)
-    p.add_argument("--adam-eps", type=float, default=1e-4)
+    p.add_argument("--adam-eps", type=float, default=1e-8)
     p.add_argument("--max-new-tokens", type=int, default=8)
     p.add_argument("--multi-turn", action="store_true",
                    help="one sequence per game: the policy sees every earlier board "
@@ -104,8 +104,8 @@ def main() -> None:
     random.seed(args.seed + rank)
 
     if main:
-        print(f"loading {args.model} on {dist.world_size()} GPU(s) (float16) ...")
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
+        print(f"loading {args.model} on {dist.world_size()} GPU(s) (float32 weights, fp16 compute) ...")
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
     model.to(device)
     model.config.use_cache = False
     tokenizer = AutoTokenizer.from_pretrained(args.model)

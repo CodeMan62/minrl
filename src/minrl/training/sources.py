@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import random
 import threading
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from minrl.rollout_engine import Actor, Group, RolloutEngine
 from minrl.types import Batch, BatchSource
@@ -16,6 +16,13 @@ class RolloutSource(BatchSource):
     this class -- and packs each :meth:`next_batch` call's ``batch_size //
     group_size`` groups into one :class:`Batch`, with ``meta["staleness"]``
     and ``["staleness_max"]`` read straight off the groups' own staleness.
+
+    ``drop_uniform`` is DAPO's dynamic sampling: a group whose rollouts all
+    got the same return has zero group-relative advantage, so it is dropped
+    and another generated in its place (``meta["dropped_groups"]``). Without
+    it such groups still count in the loss normalizer and only dilute the
+    step. After ``max_redraws`` times the requested groups it gives up and
+    serves what it has, so a too-easy or too-hard dataset cannot hang training.
     """
 
     def __init__(
@@ -28,12 +35,18 @@ class RolloutSource(BatchSource):
         concurrency: int = 1,
         max_queued: Optional[int] = None,
         seed: int = 0,
+        drop_uniform: bool = False,
+        max_redraws: int = 4,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if batch_size % group_size:
             raise ValueError(f"batch_size={batch_size} is not a multiple of group_size={group_size}")
+        if max_redraws < 1:
+            raise ValueError("max_redraws must be at least 1")
         self.groups_per_batch = batch_size // group_size
+        self.drop_uniform = drop_uniform
+        self.max_redraws = max_redraws
         self.engine = RolloutEngine(
             make, max_steps=max_steps, group_size=group_size, concurrency=concurrency,
             max_queued=max_queued, seed=seed,
@@ -46,17 +59,33 @@ class RolloutSource(BatchSource):
     def _call(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
-    async def _groups(self, n: int) -> List[Group]:
-        return [await self.engine.generate() for _ in range(n)]
+    async def _groups(self, n: int) -> Tuple[List[Group], List[Group]]:
+        """The groups to train on, and the uniform ones dropped on the way."""
+        if not self.drop_uniform:
+            return [await self.engine.generate() for _ in range(n)], []
+        kept: List[Group] = []
+        uniform: List[Group] = []
+        for _ in range(n * self.max_redraws):
+            group = await self.engine.generate()
+            (kept if _varies(group) else uniform).append(group)
+            if len(kept) == n:
+                return kept, uniform
+        # Out of draws: top up with uniform groups, which carry no signal but keep the batch shape.
+        short = n - len(kept)
+        return kept + uniform[:short], uniform[short:]
 
     def next_batch(self) -> Batch:
-        groups = self._call(self._groups(self.groups_per_batch))
+        groups, dropped = self._call(self._groups(self.groups_per_batch))
         staleness = [g.staleness for g in groups]
+        # Kept groups are biased towards ~50% success; this is the policy's real rate.
+        drawn = [r.total_reward for g in groups + dropped for r in g.rollouts]
         return Batch(
             rollouts=[r for g in groups for r in g.rollouts],
             meta={
                 "staleness": sum(staleness) / len(staleness),
                 "staleness_max": float(max(staleness)),
+                "dropped_groups": float(len(dropped)),
+                "sampled_return": sum(drawn) / len(drawn),
             },
         )
 
@@ -88,6 +117,12 @@ class RolloutSource(BatchSource):
 
     def __exit__(self, *_) -> None:
         self.close()
+
+
+def _varies(group: Group) -> bool:
+    """True if the group's rollouts did not all earn the same return."""
+    returns = [r.total_reward for r in group.rollouts]
+    return max(returns) != min(returns)
 
 
 class DatasetSource(BatchSource):
