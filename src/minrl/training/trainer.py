@@ -179,6 +179,7 @@ class Trainer:
             self.sequences += int(stats["n_seqs"])
             if self.runtime is not None and cfg.sync_every and self.step % cfg.sync_every == 0:
                 self.push_weights_to_runtime()
+                self._policy_updated()
             if cfg.ckpt_every and self.step % cfg.ckpt_every == 0:
                 self.save()
             stats = {**stats, "step": float(self.step), "tokens": float(self.tokens)}
@@ -231,6 +232,12 @@ class Trainer:
             exe.shutdown(wait=False)
         if cfg.sync_pause:
             self.runtime.resume()
+
+    def _policy_updated(self) -> None:
+        """Tell a version-aware source that the runtime now serves the policy after ``self.step`` steps."""
+        update = getattr(self.source, "on_policy_update", None)
+        if update is not None:
+            update(self.step)
 
     def _open_runtime_link(self) -> PyNcclCommunicator:
         """Rank 0 forms one NCCL group with the runtime's workers: itself as rank 0, them after."""
@@ -306,4 +313,6 @@ class Trainer:
         if "source" in ck.rank:
             self.source.load_state_dict(ck.rank["source"])
         # The runtime still holds the base weights; serve the resumed policy.
-        self.push_weights_to_runtime()
+        if self.runtime is not None:
+            self.push_weights_to_runtime()
+            self._policy_updated()

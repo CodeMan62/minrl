@@ -47,7 +47,7 @@ class RolloutSource(BatchSource):
         self.groups_per_batch = batch_size // group_size
         self.drop_uniform = drop_uniform
         self.max_redraws = max_redraws
-        self.engine = RolloutEngine(
+        self.engine = self._engine(
             make, max_steps=max_steps, group_size=group_size, concurrency=concurrency,
             max_queued=max_queued, seed=seed,
         )
@@ -55,6 +55,10 @@ class RolloutSource(BatchSource):
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
         self._call(self.engine.__aenter__())
+
+    def _engine(self, make: Callable[[], Actor], **kwargs) -> RolloutEngine:
+        """The engine to run; subclasses swap in their own scheduling."""
+        return RolloutEngine(make, **kwargs)
 
     def _call(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()

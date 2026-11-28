@@ -14,6 +14,16 @@ or on GPUs 1-3 with FSDP2 (one rank per GPU, each collecting its own group)::
 
 After every optimizer step the trainer broadcasts its weights to vLLM, so the
 next group is sampled from the updated policy.
+
+To go fully async, swap the rollout source::
+
+    # ↓↓↓ This is the only knob you need to flip to go fully-async ↓↓↓
+    CUDA_VISIBLE_DEVICES=1 python examples/gsm8k/train_grpo.py \\
+        --rollout-source-path minrl.training.fully_async.FullyAsyncRolloutSource
+
+Every rollout then records the policy versions it was sampled under, and
+groups more than ``--max-staleness`` versions behind the trainer are never
+started (or are dropped if a push overtakes them).
 """
 
 import argparse
@@ -36,8 +46,8 @@ from minrl.loggers import make_logger
 from minrl.training import dist
 from minrl.training.algorithms import grpo
 from minrl.training.config import TrainerConfig
-from minrl.training.sources import RolloutSource
 from minrl.training.trainer import Trainer
+from minrl.utils import load_path
 
 # ``enviornments`` lives at the repo root and is not an installed package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -68,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clip-eps", type=float, default=0.2)
     p.add_argument("--concurrency", type=int, default=16,
                    help="groups generating at once while the trainer steps")
+    p.add_argument("--rollout-source-path", default="minrl.training.sources.RolloutSource",
+                   help="dotted path to the BatchSource class that feeds the trainer; "
+                        "minrl.training.fully_async.FullyAsyncRolloutSource goes fully async")
+    p.add_argument("--max-staleness", type=int, default=None,
+                   help="fully-async only: policy versions a group may lag the trainer "
+                        "by when it is trained on (the source's default if unset)")
     p.add_argument("--eval-every", type=int, default=20)
     p.add_argument("--eval-samples", type=int, default=None,
                    help="test questions per eval; default is all 1319 (fewer is noisy: "
@@ -135,18 +151,23 @@ def main() -> None:
     ))
     make_eval = make_actor(0.0, lambda: GSM8K(split="test"))
 
+    # groups_per_step groups per step: group_size answers to each question,
+    # the set the group-relative advantages are computed over. Groups that
+    # all scored the same teach nothing and are swapped for fresh ones.
+    source_kwargs = dict(
+        batch_size=args.groups_per_step * args.group_size, max_steps=1,
+        group_size=args.group_size, concurrency=args.concurrency,
+        drop_uniform=args.drop_uniform,
+    )
+    if args.max_staleness is not None:
+        source_kwargs["max_staleness"] = args.max_staleness
+    source = load_path(args.rollout_source_path)(make_train, **source_kwargs)
+
     logger = make_logger(args) if main else None
     trainer = Trainer(
         model,
         algorithm=grpo(clip_eps=args.clip_eps, group_size=args.group_size),
-        # groups_per_step groups per step: group_size answers to each question,
-        # the set the group-relative advantages are computed over. Groups that
-        # all scored the same teach nothing and are swapped for fresh ones.
-        source=RolloutSource(
-            make_train, batch_size=args.groups_per_step * args.group_size, max_steps=1,
-            group_size=args.group_size, concurrency=args.concurrency,
-            drop_uniform=args.drop_uniform,
-        ),
+        source=source,
         config=TrainerConfig(
             lr=args.lr,
             eps=args.adam_eps,
